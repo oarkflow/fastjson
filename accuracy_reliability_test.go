@@ -360,6 +360,136 @@ func TestHTMLEscape(t *testing.T) {
 	}
 }
 
+type HTMLStruct struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+func TestHTMLEscapeMarshalDefault(t *testing.T) {
+	v := HTMLStruct{Name: "test", Value: "<hidden>"}
+	b, err := Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(b, []byte(`\u003c`)) {
+		t.Fatalf("Marshal should NOT escape HTML by default, got: %s", b)
+	}
+	if !bytes.Contains(b, []byte(`<hidden>`)) {
+		t.Fatalf("Marshal should contain raw <hidden>, got: %s", b)
+	}
+}
+
+func TestHTMLEscapeMarshalEscape(t *testing.T) {
+	v := HTMLStruct{Name: "test", Value: "<hidden>"}
+	b, err := MarshalEscape(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(b, []byte(`\u003c`)) {
+		t.Fatalf("MarshalEscape should escape '<', got: %s", b)
+	}
+	if !bytes.Contains(b, []byte(`\u003e`)) {
+		t.Fatalf("MarshalEscape should escape '>', got: %s", b)
+	}
+}
+
+func TestHTMLEscapeEncoderToggle(t *testing.T) {
+	v := HTMLStruct{Name: "test", Value: "<hidden>"}
+
+	// Default: no HTML escape
+	var buf1 bytes.Buffer
+	enc1 := NewEncoder(&buf1)
+	if err := enc1.Encode(v); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(buf1.Bytes(), []byte(`\u003c`)) {
+		t.Fatalf("Encoder default should NOT escape HTML, got: %s", buf1.String())
+	}
+
+	// SetEscapeHTML(true): should escape
+	var buf2 bytes.Buffer
+	enc2 := NewEncoder(&buf2)
+	enc2.SetEscapeHTML(true)
+	if err := enc2.Encode(v); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(buf2.Bytes(), []byte(`\u003c`)) {
+		t.Fatalf("Encoder SetEscapeHTML(true) should escape HTML, got: %s", buf2.String())
+	}
+
+	// SetEscapeHTML(false): should NOT escape
+	var buf3 bytes.Buffer
+	enc3 := NewEncoder(&buf3)
+	enc3.SetEscapeHTML(true)
+	enc3.SetEscapeHTML(false)
+	if err := enc3.Encode(v); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(buf3.Bytes(), []byte(`\u003c`)) {
+		t.Fatalf("Encoder SetEscapeHTML(false) should NOT escape HTML, got: %s", buf3.String())
+	}
+}
+
+func TestHTMLEscapeAppenderToggle(t *testing.T) {
+	// Default: no HTML escape
+	a := NewAppender(nil)
+	a.String("<hidden>")
+	if bytes.Contains(a.Bytes(), []byte(`\u003c`)) {
+		t.Fatalf("Appender default should NOT escape HTML, got: %s", a.Bytes())
+	}
+	if string(a.Bytes()) != `"<hidden>"` {
+		t.Fatalf("Appender default should contain raw <hidden>, got: %s", a.Bytes())
+	}
+
+	// EscapeHTML: true
+	a2 := NewAppender(nil)
+	a2.EscapeHTML = true
+	a2.String("<hidden>")
+	if !bytes.Contains(a2.Bytes(), []byte(`\u003c`)) {
+		t.Fatalf("Appender EscapeHTML=true should escape HTML, got: %s", a2.Bytes())
+	}
+}
+
+func TestHTMLEscapeMapAndSlice(t *testing.T) {
+	m := map[string]string{"key": "<hidden>"}
+
+	// Default Marshal: no escape
+	b, err := Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(b, []byte(`\u003c`)) {
+		t.Fatalf("Marshal map should NOT escape HTML by default, got: %s", b)
+	}
+
+	// MarshalEscape: escape
+	b2, err := MarshalEscape(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(b2, []byte(`\u003c`)) {
+		t.Fatalf("MarshalEscape map should escape HTML, got: %s", b2)
+	}
+
+	// Slice
+	s := []string{"<hidden>"}
+	b3, err := Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(b3, []byte(`\u003c`)) {
+		t.Fatalf("Marshal slice should NOT escape HTML by default, got: %s", b3)
+	}
+
+	b4, err := MarshalEscape(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(b4, []byte(`\u003c`)) {
+		t.Fatalf("MarshalEscape slice should escape HTML, got: %s", b4)
+	}
+}
+
 func TestMarshalIndent(t *testing.T) {
 	in := sampleAccuracyUser()
 	got, err := MarshalIndent(in, "", "  ")

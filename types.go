@@ -42,7 +42,7 @@ type Encoder struct {
 	prefix, indent string
 }
 
-func NewEncoder(w io.Writer) *Encoder              { return &Encoder{w: w, escapeHTML: true} }
+func NewEncoder(w io.Writer) *Encoder              { return &Encoder{w: w} }
 func (e *Encoder) SetIndent(prefix, indent string) { e.prefix = prefix; e.indent = indent }
 func (e *Encoder) SetEscapeHTML(on bool)           { e.escapeHTML = on }
 func (e *Encoder) Encode(v any) error {
@@ -51,9 +51,9 @@ func (e *Encoder) Encode(v any) error {
 	if e.indent != "" {
 		b, err = MarshalIndent(v, e.prefix, e.indent)
 	} else if e.escapeHTML {
-		b, err = Marshal(v)
+		b, err = MarshalEscape(v)
 	} else {
-		b, err = MarshalNoEscape(v)
+		b, err = Marshal(v)
 	}
 	if err != nil {
 		return err
@@ -153,8 +153,10 @@ func MarshalNoEscape(v any) ([]byte, error) {
 	buf := make([]byte, 0, 256)
 	return appendValue(buf, v, false)
 }
-func Marshal(v any) ([]byte, error)                       { buf := make([]byte, 0, 256); return appendValue(buf, v, true) }
-func MarshalTo(dst []byte, v any) ([]byte, error)         { return appendValue(dst, v, true) }
+func Marshal(v any) ([]byte, error)                       { buf := make([]byte, 0, 256); return appendValue(buf, v, false) }
+func MarshalEscape(v any) ([]byte, error)                 { buf := make([]byte, 0, 256); return appendValue(buf, v, true) }
+func MarshalTo(dst []byte, v any) ([]byte, error)         { return appendValue(dst, v, false) }
+func MarshalEscapeTo(dst []byte, v any) ([]byte, error)   { return appendValue(dst, v, true) }
 func MarshalNoEscapeTo(dst []byte, v any) ([]byte, error) { return appendValue(dst, v, false) }
 func Unmarshal(data []byte, v any) error                  { return UnmarshalOptions(data, v, decodeOptions{}) }
 

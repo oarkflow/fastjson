@@ -7,7 +7,7 @@ type Appender struct {
 	EscapeHTML bool
 }
 
-func NewAppender(dst []byte) *Appender { return &Appender{B: dst, EscapeHTML: true} }
+func NewAppender(dst []byte) *Appender { return &Appender{B: dst} }
 func (a *Appender) Reset(dst []byte)   { a.B = dst }
 func (a *Appender) Bytes() []byte      { return a.B }
 func (a *Appender) Null()              { a.B = append(a.B, "null"...) }
