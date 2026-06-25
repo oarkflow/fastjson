@@ -32,6 +32,9 @@ func appendValue(dst []byte, v any, html bool) ([]byte, error) {
 	if v == nil {
 		return append(dst, "null"...), nil
 	}
+	if n, ok := v.(Number); ok {
+		return appendNumber(dst, n)
+	}
 	if m, ok := v.(Marshaler); ok {
 		b, err := m.MarshalJSON()
 		if err != nil {
@@ -75,6 +78,9 @@ func appendReflect(dst []byte, rv reflect.Value, html bool) ([]byte, error) {
 		rv = rv.Elem()
 	}
 	if rv.CanInterface() {
+		if n, ok := rv.Interface().(Number); ok {
+			return appendNumber(dst, n)
+		}
 		if m, ok := rv.Interface().(Marshaler); ok {
 			b, e := m.MarshalJSON()
 			if e != nil {
@@ -435,4 +441,12 @@ func isEmptyPtr(p unsafe.Pointer, t reflect.Type, k reflect.Kind) bool {
 		return reflect.NewAt(t, p).Elem().IsNil()
 	}
 	return false
+}
+
+func appendNumber(dst []byte, n Number) ([]byte, error) {
+	s := string(n)
+	if !validNumberLiteral(s) {
+		return dst, errors.New("fastjson: invalid Number literal")
+	}
+	return append(dst, s...), nil
 }

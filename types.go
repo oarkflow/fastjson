@@ -13,6 +13,56 @@ func (n Number) String() string            { return string(n) }
 func (n Number) Float64() (float64, error) { return strconv.ParseFloat(string(n), 64) }
 func (n Number) Int64() (int64, error)     { return strconv.ParseInt(string(n), 10, 64) }
 
+// MarshalJSON emits Number as a JSON number literal, not as a quoted string.
+// This mirrors encoding/json.Number behavior and keeps UseNumber round-trips
+// valid for generic config trees such as map[string]any / []any.
+func (n Number) MarshalJSON() ([]byte, error) {
+	s := string(n)
+	if !validNumberLiteral(s) {
+		return nil, errors.New("fastjson: invalid Number literal")
+	}
+	return []byte(s), nil
+}
+
+// NormalizeNumbers recursively converts fastjson.Number values in generic value
+// trees to concrete Go numeric types. It mutates maps and slices in place.
+//
+// Prefer Marshal for normal encoding; Marshal already writes Number as a raw
+// JSON number. Use NormalizeNumbers when handing decoded trees to code that
+// does not understand fastjson.Number.
+func NormalizeNumbers(v any) any {
+	switch x := v.(type) {
+	case Number:
+		if i, err := x.Int64(); err == nil {
+			return i
+		}
+		if f, err := x.Float64(); err == nil {
+			return f
+		}
+		return v
+	case map[string]any:
+		for k, val := range x {
+			x[k] = NormalizeNumbers(val)
+		}
+		return x
+	case []any:
+		for i, val := range x {
+			x[i] = NormalizeNumbers(val)
+		}
+		return x
+	default:
+		return v
+	}
+}
+
+func validNumberLiteral(s string) bool {
+	if s == "" {
+		return false
+	}
+	n, err := numberEnd([]byte(s), 0)
+	return err == nil && n == len(s)
+}
+
 type RawMessage []byte
 
 func (m RawMessage) MarshalJSON() ([]byte, error) {
@@ -153,8 +203,11 @@ func MarshalNoEscape(v any) ([]byte, error) {
 	buf := make([]byte, 0, 256)
 	return appendValue(buf, v, false)
 }
-func Marshal(v any) ([]byte, error)                       { buf := make([]byte, 0, 256); return appendValue(buf, v, false) }
-func MarshalEscape(v any) ([]byte, error)                 { buf := make([]byte, 0, 256); return appendValue(buf, v, true) }
+func Marshal(v any) ([]byte, error) { buf := make([]byte, 0, 256); return appendValue(buf, v, false) }
+func MarshalEscape(v any) ([]byte, error) {
+	buf := make([]byte, 0, 256)
+	return appendValue(buf, v, true)
+}
 func MarshalTo(dst []byte, v any) ([]byte, error)         { return appendValue(dst, v, false) }
 func MarshalEscapeTo(dst []byte, v any) ([]byte, error)   { return appendValue(dst, v, true) }
 func MarshalNoEscapeTo(dst []byte, v any) ([]byte, error) { return appendValue(dst, v, false) }
