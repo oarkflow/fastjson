@@ -19,6 +19,7 @@ type decPlan struct {
 	typ    reflect.Type
 	fields map[string]*decField
 	list   []*decField
+	byLen  [][]*decField
 }
 
 var decCache sync.Map
@@ -168,6 +169,7 @@ func decodeStructPtr(b []byte, off int, t reflect.Type, base unsafe.Pointer, opt
 	if i < len(b) && b[i] == '}' {
 		return i + 1, nil
 	}
+	byLen := p.byLen
 	for {
 		if i >= len(b) || b[i] != '"' {
 			return i, syntaxErr("expected object key", i)
@@ -185,10 +187,13 @@ func decodeStructPtr(b []byte, off int, t reflect.Type, base unsafe.Pointer, opt
 		var f *decField
 		var key string
 		if simple && j < len(b) {
-			for _, cand := range p.list {
-				if bytesEqString(b[ks:j], cand.name) {
-					f = cand
-					break
+			keyLen := j - ks
+			if keyLen < len(byLen) {
+				for _, cand := range byLen[keyLen] {
+					if bytesEqString(b[ks:j], cand.name) {
+						f = cand
+						break
+					}
 				}
 			}
 			i = j + 1
@@ -242,11 +247,20 @@ func getDecPlan(t reflect.Type) *decPlan {
 	}
 	p := &decPlan{typ: t, fields: map[string]*decField{}}
 	ep := getEncPlan(t)
+	maxLen := 0
 	for _, ef := range ep.fields {
 		f := &decField{name: ef.name, offset: ef.offset, typ: ef.typ, kind: ef.kind}
 		f.set = makeSetter(ef.typ)
 		p.fields[f.name] = f
 		p.list = append(p.list, f)
+		if l := len(ef.name); l > maxLen {
+			maxLen = l
+		}
+	}
+	p.byLen = make([][]*decField, maxLen+1)
+	for _, f := range p.list {
+		l := len(f.name)
+		p.byLen[l] = append(p.byLen[l], f)
 	}
 	actual, _ := decCache.LoadOrStore(t, p)
 	return actual.(*decPlan)
@@ -552,7 +566,19 @@ func decodeMap(b []byte, off int, rv reflect.Value, opt decodeOptions) (int, err
 		i = skipWS(b, i+1)
 	}
 }
-func hasLit(b []byte, i int, s string) bool { return i+len(s) <= len(b) && string(b[i:i+len(s)]) == s }
+
+// hasLit checks if the bytes at b[i:] match string s using direct byte comparison.
+func hasLit(b []byte, i int, s string) bool {
+	if i+len(s) > len(b) {
+		return false
+	}
+	for j := 0; j < len(s); j++ {
+		if b[i+j] != s[j] {
+			return false
+		}
+	}
+	return true
+}
 func stringTrimEq(b []byte, s string) bool {
 	i := skipWS(b, 0)
 	return i+len(s) == skipWS(b, i+len(s)) && hasLit(b, i, s)
