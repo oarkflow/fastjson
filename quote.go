@@ -7,37 +7,116 @@ import (
 
 var hex = "0123456789abcdef"
 
+// escapeTable[c] is true for JSON characters that need escaping in strings
+var escapeTable [256]bool
+var escapeTableHTML [256]bool
+
+func init() {
+	for c := 0; c < 0x20; c++ {
+		escapeTable[c] = true
+		escapeTableHTML[c] = true
+	}
+	escapeTable['\\'] = true
+	escapeTable['"'] = true
+	escapeTableHTML['\\'] = true
+	escapeTableHTML['"'] = true
+	escapeTableHTML['<'] = true
+	escapeTableHTML['>'] = true
+	escapeTableHTML['&'] = true
+}
+
 func appendString(dst []byte, s string, html bool) []byte {
 	dst = append(dst, '"')
-	start := 0
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < 0x20 || c == '\\' || c == '"' || (html && (c == '<' || c == '>' || c == '&')) {
-			dst = append(dst, s[start:i]...)
-			switch c {
-			case '\\', '"':
-				dst = append(dst, '\\', c)
-			case '\n':
-				dst = append(dst, '\\', 'n')
-			case '\r':
-				dst = append(dst, '\\', 'r')
-			case '\t':
-				dst = append(dst, '\\', 't')
-			case '\b':
-				dst = append(dst, '\\', 'b')
-			case '\f':
-				dst = append(dst, '\\', 'f')
-			default:
-				dst = append(dst, '\\', 'u', '0', '0', hex[c>>4], hex[c&15])
-			}
-			start = i + 1
-		}
+	if html {
+		return appendStringHTML(dst, s)
 	}
-	dst = append(dst, s[start:]...)
+	return appendStringPlain(dst, s)
+}
+
+func appendStringPlain(dst []byte, s string) []byte {
+	start := 0
+	n := len(s)
+	for start < n {
+		i := start
+		for i < n && !escapeTable[s[i]] {
+			i++
+		}
+		if i > start {
+			dst = append(dst, s[start:i]...)
+		}
+		if i >= n {
+			break
+		}
+		c := s[i]
+		switch c {
+		case '\\', '"':
+			dst = append(dst, '\\', c)
+		case '\n':
+			dst = append(dst, '\\', 'n')
+		case '\r':
+			dst = append(dst, '\\', 'r')
+		case '\t':
+			dst = append(dst, '\\', 't')
+		case '\b':
+			dst = append(dst, '\\', 'b')
+		case '\f':
+			dst = append(dst, '\\', 'f')
+		default:
+			dst = append(dst, "\\u00"...)
+			dst = append(dst, hex[c>>4], hex[c&0x0f])
+		}
+		start = i + 1
+	}
 	dst = append(dst, '"')
 	return dst
 }
 
+func appendStringHTML(dst []byte, s string) []byte {
+	start := 0
+	n := len(s)
+	for start < n {
+		// bulk-scan using lookup table
+		i := start
+		for i < n && !escapeTableHTML[s[i]] {
+			i++
+		}
+		if i > start {
+			dst = append(dst, s[start:i]...)
+		}
+		if i >= n {
+			break
+		}
+		c := s[i]
+		switch c {
+		case '\\', '"':
+			dst = append(dst, '\\', c)
+		case '\n':
+			dst = append(dst, '\\', 'n')
+		case '\r':
+			dst = append(dst, '\\', 'r')
+		case '\t':
+			dst = append(dst, '\\', 't')
+		case '\b':
+			dst = append(dst, '\\', 'b')
+		case '\f':
+			dst = append(dst, '\\', 'f')
+		case '<':
+			dst = append(dst, `\u003c`...)
+		case '>':
+			dst = append(dst, `\u003e`...)
+		case '&':
+			dst = append(dst, `\u0026`...)
+		default:
+			dst = append(dst, "\\u00"...)
+			dst = append(dst, hex[c>>4], hex[c&0x0f])
+		}
+		start = i + 1
+	}
+	dst = append(dst, '"')
+	return dst
+}
+
+// parseString fully parses a JSON string, handling escapes and Unicode.
 func parseString(b []byte, i int) (string, int, error) {
 	if i >= len(b) || b[i] != '"' {
 		return "", i, syntaxErr("expected string", i)
@@ -167,72 +246,72 @@ func parseStringZC(b []byte, i int) (string, int, error) {
 	start := i + 1
 	j := start
 	n := len(b)
-	// unrolled scan: 8 bytes at a time for common ASCII-only strings
 	for j+7 < n {
-		c0 := b[j]
-		if c0 == '"' {
+		if b[j] == '"' {
 			return emptyOrUnsafe(b, start, j), j + 1, nil
 		}
-		if c0 == '\\' || c0 < 0x20 || c0 >= 0x80 {
+		if escapeTable[b[j]] {
 			return parseStringFallback(b, i, start, j)
 		}
-		c1 := b[j+1]
-		if c1 == '"' {
+		if b[j+1] == '"' {
 			return emptyOrUnsafe(b, start, j+1), j + 2, nil
 		}
-		if c1 == '\\' || c1 < 0x20 || c1 >= 0x80 {
+		if escapeTable[b[j+1]] {
 			return parseStringFallback(b, i, start, j+1)
 		}
-		c2 := b[j+2]
-		if c2 == '"' {
+		if b[j+2] == '"' {
 			return emptyOrUnsafe(b, start, j+2), j + 3, nil
 		}
-		if c2 == '\\' || c2 < 0x20 || c2 >= 0x80 {
+		if escapeTable[b[j+2]] {
 			return parseStringFallback(b, i, start, j+2)
 		}
-		c3 := b[j+3]
-		if c3 == '"' {
+		if b[j+3] == '"' {
 			return emptyOrUnsafe(b, start, j+3), j + 4, nil
 		}
-		if c3 == '\\' || c3 < 0x20 || c3 >= 0x80 {
+		if escapeTable[b[j+3]] {
 			return parseStringFallback(b, i, start, j+3)
 		}
-		c4 := b[j+4]
-		if c4 == '"' {
+		if b[j+4] == '"' {
 			return emptyOrUnsafe(b, start, j+4), j + 5, nil
 		}
-		if c4 == '\\' || c4 < 0x20 || c4 >= 0x80 {
+		if escapeTable[b[j+4]] {
 			return parseStringFallback(b, i, start, j+4)
 		}
-		c5 := b[j+5]
-		if c5 == '"' {
+		if b[j+5] == '"' {
 			return emptyOrUnsafe(b, start, j+5), j + 6, nil
 		}
-		if c5 == '\\' || c5 < 0x20 || c5 >= 0x80 {
+		if escapeTable[b[j+5]] {
 			return parseStringFallback(b, i, start, j+5)
 		}
-		c6 := b[j+6]
-		if c6 == '"' {
+		if b[j+6] == '"' {
 			return emptyOrUnsafe(b, start, j+6), j + 7, nil
 		}
-		if c6 == '\\' || c6 < 0x20 || c6 >= 0x80 {
+		if escapeTable[b[j+6]] {
 			return parseStringFallback(b, i, start, j+6)
 		}
-		c7 := b[j+7]
-		if c7 == '"' {
+		if b[j+7] == '"' {
 			return emptyOrUnsafe(b, start, j+7), j + 8, nil
 		}
-		if c7 == '\\' || c7 < 0x20 || c7 >= 0x80 {
+		if escapeTable[b[j+7]] {
 			return parseStringFallback(b, i, start, j+7)
 		}
 		j += 8
+	}
+	for j < n {
+		if b[j] == '"' {
+			return emptyOrUnsafe(b, start, j), j + 1, nil
+		}
+		if escapeTable[b[j]] {
+			return parseStringFallback(b, i, start, j)
+		}
+		j++
 	}
 	for j < n {
 		c := b[j]
 		if c == '"' {
 			return emptyOrUnsafe(b, start, j), j + 1, nil
 		}
-		if c == '\\' || c < 0x20 || c >= 0x80 {
+		if escapeTable[c] {
 			return parseStringFallback(b, i, start, j)
 		}
 		j++
@@ -247,13 +326,10 @@ func emptyOrUnsafe(b []byte, start, end int) string {
 	return unsafeString(b[start:end])
 }
 
-// parseStringFallback is called when the fast path encounters a non-ASCII or escaped char.
 func parseStringFallback(b []byte, origOff int, start, end int) (string, int, error) {
-	// If we haven't consumed any chars yet, just use parseString from the original offset.
 	if end == start {
 		return parseString(b, origOff)
 	}
-	// We have some safe prefix; build result from what we've already scanned plus the rest.
 	out := make([]byte, 0, len(b)-start)
 	out = append(out, b[start:end]...)
 	i := end

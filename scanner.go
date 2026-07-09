@@ -386,7 +386,7 @@ func Get(src []byte, key string) ([]byte, error) {
 			matched = (j-ks) == len(key) && bytesEqString(src[ks:j], key)
 			i = j + 1
 		} else {
-			k, n, err := parseString(src, i)
+			k, n, err := parseStringZC(src, i)
 			if err != nil {
 				return nil, err
 			}

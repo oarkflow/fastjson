@@ -11,18 +11,20 @@ import (
 )
 
 type encField struct {
-	name    string
-	quoted  string
-	index   []int
-	offset  uintptr
-	typ     reflect.Type
-	kind    reflect.Kind
-	omit    bool
-	encoder func([]byte, unsafe.Pointer, bool) ([]byte, error)
+	name        string
+	quoted      string
+	quotedComma string
+	index       []int
+	offset      uintptr
+	typ         reflect.Type
+	kind        reflect.Kind
+	omit        bool
+	encoder     func([]byte, unsafe.Pointer, bool) ([]byte, error)
 }
 type encPlan struct {
-	typ    reflect.Type
-	fields []encField
+	typ       reflect.Type
+	fields    []encField
+	activeIdx int // index of first non-omit field
 }
 
 var encCache sync.Map
@@ -150,37 +152,28 @@ func appendStruct(dst []byte, rv reflect.Value, html bool) ([]byte, error) {
 	tmp.Set(rv)
 	return appendStructPtr(dst, rv.Type(), unsafe.Pointer(tmp.UnsafeAddr()), html)
 }
+
+// appendStructPtrFast is the hot-path struct marshaler with inlined type dispatch.
 func appendStructPtr(dst []byte, t reflect.Type, base unsafe.Pointer, html bool) ([]byte, error) {
 	p := getEncPlan(t)
 	dst = append(dst, '{')
-	var i int
-	// find first non-omit field
-	for i < len(p.fields) {
-		f := &p.fields[i]
+	var err error
+	fields := p.fields
+	// Find and encode the first non-omit field
+	first := true
+	for i := range fields {
+		f := &fields[i]
 		fp := unsafe.Pointer(uintptr(base) + f.offset)
-		i++
 		if f.omit && isEmptyPtr(fp, f.typ, f.kind) {
 			continue
 		}
-		dst = append(dst, f.quoted...)
-		var err error
-		dst, err = f.encoder(dst, fp, html)
-		if err != nil {
-			return dst, err
+		if first {
+			dst = append(dst, f.quoted...)
+			first = false
+		} else {
+			dst = append(dst, f.quotedComma...)
 		}
-		break
-	}
-	for i < len(p.fields) {
-		f := &p.fields[i]
-		fp := unsafe.Pointer(uintptr(base) + f.offset)
-		i++
-		if f.omit && isEmptyPtr(fp, f.typ, f.kind) {
-			continue
-		}
-		dst = append(dst, ',')
-		dst = append(dst, f.quoted...)
-		var err error
-		dst, err = f.encoder(dst, fp, html)
+		dst, err = encodeFieldValue(dst, f.kind, f.typ, fp, f.encoder, html)
 		if err != nil {
 			return dst, err
 		}
@@ -188,6 +181,143 @@ func appendStructPtr(dst []byte, t reflect.Type, base unsafe.Pointer, html bool)
 	dst = append(dst, '}')
 	return dst, nil
 }
+
+// encodeFieldValue writes a single field value without closure overhead.
+// enc is the precomputed fallback encoder from encPlan.
+func encodeFieldValue(dst []byte, k reflect.Kind, t reflect.Type, fp unsafe.Pointer, enc func([]byte, unsafe.Pointer, bool) ([]byte, error), html bool) ([]byte, error) {
+	switch k {
+	case reflect.String:
+		return appendString(dst, *(*string)(fp), html), nil
+	case reflect.Int:
+		return strconv.AppendInt(dst, int64(*(*int)(fp)), 10), nil
+	case reflect.Int8:
+		return strconv.AppendInt(dst, int64(*(*int8)(fp)), 10), nil
+	case reflect.Int16:
+		return strconv.AppendInt(dst, int64(*(*int16)(fp)), 10), nil
+	case reflect.Int32:
+		return strconv.AppendInt(dst, int64(*(*int32)(fp)), 10), nil
+	case reflect.Int64:
+		return strconv.AppendInt(dst, *(*int64)(fp), 10), nil
+	case reflect.Uint:
+		return strconv.AppendUint(dst, uint64(*(*uint)(fp)), 10), nil
+	case reflect.Uint8:
+		return strconv.AppendUint(dst, uint64(*(*uint8)(fp)), 10), nil
+	case reflect.Uint16:
+		return strconv.AppendUint(dst, uint64(*(*uint16)(fp)), 10), nil
+	case reflect.Uint32:
+		return strconv.AppendUint(dst, uint64(*(*uint32)(fp)), 10), nil
+	case reflect.Uint64:
+		return strconv.AppendUint(dst, *(*uint64)(fp), 10), nil
+	case reflect.Float32:
+		return strconv.AppendFloat(dst, float64(*(*float32)(fp)), 'g', -1, 32), nil
+	case reflect.Float64:
+		return strconv.AppendFloat(dst, *(*float64)(fp), 'g', -1, 64), nil
+	case reflect.Bool:
+		if *(*bool)(fp) {
+			return append(dst, "true"...), nil
+		}
+		return append(dst, "false"...), nil
+	case reflect.Struct:
+		return appendStructPtr(dst, t, fp, html)
+	case reflect.Slice:
+		if t.Elem().Kind() == reflect.String {
+			return encodeStringSlice(dst, *(*[]string)(fp), html)
+		}
+		if t.Elem().Kind() == reflect.Int {
+			return encodeIntSlice(dst, *(*[]int)(fp))
+		}
+		return enc(dst, fp, html)
+	case reflect.Map:
+		if t.Elem().Kind() == reflect.String {
+			return encodeStringMap(dst, *(*map[string]string)(fp), html)
+		}
+		if t.Elem().Kind() == reflect.Interface {
+			return encodeAnyMap(dst, *(*map[string]any)(fp), html)
+		}
+		return enc(dst, fp, html)
+	default:
+		return enc(dst, fp, html)
+	}
+}
+
+func encodeStringSlice(dst []byte, s []string, html bool) ([]byte, error) {
+	if s == nil {
+		return append(dst, "null"...), nil
+	}
+	dst = append(dst, '[')
+	for i, v := range s {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = appendString(dst, v, html)
+	}
+	dst = append(dst, ']')
+	return dst, nil
+}
+
+func encodeIntSlice(dst []byte, s []int) ([]byte, error) {
+	if s == nil {
+		return append(dst, "null"...), nil
+	}
+	dst = append(dst, '[')
+	for i, v := range s {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = strconv.AppendInt(dst, int64(v), 10)
+	}
+	dst = append(dst, ']')
+	return dst, nil
+}
+
+func encodeStringMap(dst []byte, m map[string]string, html bool) ([]byte, error) {
+	if m == nil {
+		return append(dst, "null"...), nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	dst = append(dst, '{')
+	for i, k := range keys {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = appendString(dst, k, html)
+		dst = append(dst, ':')
+		dst = appendString(dst, m[k], html)
+	}
+	dst = append(dst, '}')
+	return dst, nil
+}
+
+func encodeAnyMap(dst []byte, m map[string]any, html bool) ([]byte, error) {
+	if m == nil {
+		return append(dst, "null"...), nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	dst = append(dst, '{')
+	for i, k := range keys {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = appendString(dst, k, html)
+		dst = append(dst, ':')
+		var err error
+		dst, err = appendValue(dst, m[k], html)
+		if err != nil {
+			return dst, err
+		}
+	}
+	dst = append(dst, '}')
+	return dst, nil
+}
+
 func appendMap(dst []byte, rv reflect.Value, html bool) ([]byte, error) {
 	if rv.IsNil() {
 		return append(dst, "null"...), nil
@@ -232,7 +362,17 @@ func buildEncPlan(t reflect.Type) *encPlan {
 		if skip {
 			continue
 		}
-		f := encField{name: name, quoted: "\"" + name + "\":", index: sf.Index, offset: sf.Offset, typ: sf.Type, kind: sf.Type.Kind(), omit: omit}
+		f := encField{
+			name:        name,
+			quoted:      `"` + name + `":`,
+			quotedComma: `,"` + name + `":`,
+			index:       sf.Index,
+			offset:      sf.Offset,
+			typ:         sf.Type,
+			kind:        sf.Type.Kind(),
+			omit:        omit,
+			encoder:     nil,
+		}
 		f.encoder = makeFieldEncoder(sf.Type)
 		p.fields = append(p.fields, f)
 	}

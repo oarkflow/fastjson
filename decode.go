@@ -200,7 +200,7 @@ func decodeStructPtr(b []byte, off int, t reflect.Type, base unsafe.Pointer, opt
 		} else {
 			var n int
 			var err error
-			key, n, err = parseString(b, i)
+			key, n, err = parseStringZC(b, i)
 			if err != nil {
 				return i, err
 			}
@@ -537,7 +537,7 @@ func decodeMap(b []byte, off int, rv reflect.Value, opt decodeOptions) (int, err
 		return i + 1, nil
 	}
 	for {
-		key, n, err := parseString(b, i)
+		key, n, err := parseStringZC(b, i)
 		if err != nil {
 			return i, err
 		}
