@@ -162,8 +162,8 @@ type HTTPProduct struct {
 var httpProduct = HTTPProduct{
 	ID: 1001, Name: "Wireless Bluetooth Headphones",
 	Description: "High-quality wireless headphones with noise cancellation technology and long battery life.",
-	Price: 79.99, Currency: "USD", InStock: true, Category: "Electronics",
-	Tags:        []string{"audio", "wireless", "bluetooth", "headphones", "noise-cancelling"},
+	Price:       79.99, Currency: "USD", InStock: true, Category: "Electronics",
+	Tags:   []string{"audio", "wireless", "bluetooth", "headphones", "noise-cancelling"},
 	Rating: 4.5, ReviewCount: 2347, CreatedBy: "admin", UpdatedAt: 1710000000,
 }
 
@@ -188,50 +188,13 @@ func init() {
 	httpLargeJSON = buf.Bytes()
 }
 
-// extractFields lazily extracts only the requested keys from JSON bytes
-// without fully parsing the document. This demonstrates the lazy projection
-// pattern described in the blog post: scan JSON in one pass, grab only what you need.
+// extractFields lazily extracts only the requested top-level keys from JSON
+// bytes without decoding the rest of the document.
 func extractFields(json []byte, keys ...string) map[string][]byte {
 	result := make(map[string][]byte, len(keys))
-	i := skipWS(json, 0)
-	if i >= len(json) || json[i] != '{' {
-		return result
-	}
-	keySet := make(map[string]struct{}, len(keys))
 	for _, k := range keys {
-		keySet[k] = struct{}{}
-	}
-	i++
-	for {
-		i = skipWS(json, i)
-		if i >= len(json) || json[i] == '}' {
-			break
-		}
-		// Use zero-copy parseStringZC for the key to avoid allocation
-		key, n, err := parseStringZC(json, i)
-		if err != nil {
-			break
-		}
-		i = skipWS(json, n)
-		if i >= len(json) || json[i] != ':' {
-			break
-		}
-		i = skipWS(json, i+1)
-		end, err := valueEnd(json, i)
-		if err != nil {
-			break
-		}
-		if _, wanted := keySet[key]; wanted {
-			result[key] = json[i:end]
-			if len(result) == len(keys) {
-				return result
-			}
-		}
-		i = skipWS(json, end)
-		if i < len(json) && json[i] == ',' {
-			i++
-		} else {
-			break
+		if v, err := Get(json, k); err == nil {
+			result[k] = v
 		}
 	}
 	return result
@@ -587,65 +550,16 @@ func BenchmarkHTTPFastjsonLazyArrayField(b *testing.B) {
 		strings.Repeat(`{"id":1,"name":"alice","score":99.5,"email":"a@b.com","role":"admin"},`, 100) +
 		`{"id":101,"name":"bob","score":88.0,"email":"b@c.com","role":"user"}]`)
 	for i := 0; i < b.N; i++ {
-		j := skipWS(payload, 0)
-		if j >= len(payload) || payload[j] != '[' {
-			b.Fatal("not array")
+		var arr []struct {
+			ID int `json:"id"`
 		}
-		j++
-		var ids []int
-		for j < len(payload) {
-			j = skipWS(payload, j)
-			if j < len(payload) && payload[j] == ']' {
-				break
-			}
-			if payload[j] != '{' {
-				b.Fatal("expected object")
-			}
-			// find "id" field only
-			objStart := j
-			_ = objStart
-			objEnd, err := objectEnd(payload, j)
-			if err != nil {
-				b.Fatal(err)
-			}
-			// scan the object for "id"
-			k := j + 1
-			for k < objEnd-1 {
-				k = skipWS(payload, k)
-				key, n, err := parseString(payload, k)
-				if err != nil {
-					b.Fatal(err)
-				}
-				k = skipWS(payload, n)
-				if k >= len(payload) || payload[k] != ':' {
-					b.Fatal("expected colon")
-				}
-				valStart := skipWS(payload, k+1)
-				valEnd, err := valueEnd(payload, valStart)
-				if err != nil {
-					b.Fatal(err)
-				}
-				if key == "id" {
-					x, err := parseIntBytes(payload[valStart:valEnd])
-					if err != nil {
-						b.Fatal(err)
-					}
-					ids = append(ids, int(x))
-				}
-				k = skipWS(payload, valEnd)
-				if k < objEnd-1 && payload[k] == ',' {
-					k++
-				}
-			}
-			j = skipWS(payload, objEnd)
-			if j < len(payload) && payload[j] == ',' {
-				j++
-			}
+		if err := Unmarshal(payload, &arr); err != nil {
+			b.Fatal(err)
 		}
-		if len(ids) != 101 {
+		if len(arr) != 101 {
 			b.Fatal("wrong count")
 		}
-		sinkUser.ID = ids[0]
+		sinkUser.ID = arr[0].ID
 	}
 }
 

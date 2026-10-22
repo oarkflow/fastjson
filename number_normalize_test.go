@@ -32,8 +32,8 @@ func TestMarshalUseNumberTreeEmitsRawNumbers(t *testing.T) {
 
 func TestNormalizeNumbersConvertsTree(t *testing.T) {
 	v := map[string]any{
-		"port": Number("8080"),
-		"ratio": Number("0.75"),
+		"port":   Number("8080"),
+		"ratio":  Number("0.75"),
 		"nested": []any{Number("1"), map[string]any{"x": Number("2.5")}},
 	}
 	NormalizeNumbers(v)

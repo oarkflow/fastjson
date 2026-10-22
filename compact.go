@@ -2,142 +2,140 @@ package fastjson
 
 import "bytes"
 
+// Valid reports whether data is a valid JSON encoding.
+func Valid(data []byte) bool { return valid(data) }
+
+// Compact appends to dst the JSON-encoded src with insignificant space
+// characters elided.
 func Compact(dst *bytes.Buffer, src []byte) error {
-	if !Valid(src) {
-		_, err := valueEnd(src, 0)
-		if err != nil {
-			return err
-		}
-		return syntaxErr("invalid json", 0)
-	}
-	compactValue(dst, src, 0)
-	return nil
+	dst.Grow(len(src))
+	b, err := appendCompact(dst.AvailableBuffer(), src, false)
+	dst.Write(b)
+	return err
 }
-func compactValue(dst *bytes.Buffer, b []byte, i int) int {
-	i = skipWS(b, i)
-	switch b[i] {
-	case '"':
-		_, n, _ := parseString(b, i)
-		dst.Write(b[i:n])
-		return n
-	case '[':
-		dst.WriteByte('[')
-		i = skipWS(b, i+1)
-		if b[i] == ']' {
-			dst.WriteByte(']')
-			return i + 1
-		}
-		first := true
-		for {
-			if !first {
-				dst.WriteByte(',')
-			} else {
-				first = false
-			}
-			i = compactValue(dst, b, i)
-			i = skipWS(b, i)
-			if b[i] == ']' {
-				dst.WriteByte(']')
-				return i + 1
-			}
-			i = skipWS(b, i+1)
-		}
-	case '{':
-		dst.WriteByte('{')
-		i = skipWS(b, i+1)
-		if b[i] == '}' {
-			dst.WriteByte('}')
-			return i + 1
-		}
-		first := true
-		for {
-			if !first {
-				dst.WriteByte(',')
-			} else {
-				first = false
-			}
-			_, n, _ := parseString(b, i)
-			dst.Write(b[i:n])
-			dst.WriteByte(':')
-			i = skipWS(b, n)
-			i = compactValue(dst, b, skipWS(b, i+1))
-			i = skipWS(b, i)
-			if b[i] == '}' {
-				dst.WriteByte('}')
-				return i + 1
-			}
-			i = skipWS(b, i+1)
-		}
-	default:
-		n, _ := valueEnd(b, i)
-		dst.Write(b[i:n])
-		return n
+
+// appendCompact validates src and appends its compact form to dst. With
+// escape set, <, >, & and U+2028/U+2029 are escaped as encoding/json does
+// for the output of MarshalJSON methods.
+func appendCompact(dst, src []byte, escape bool) ([]byte, error) {
+	if !valid(src) {
+		// encoding/json's compact scanner does not count bytes, so the
+		// reported offset stays at zero.
+		return dst, stdSyntaxError(src, 0, false)
 	}
+	return appendCompactValid(dst, src, escape), nil
 }
+
+func appendCompactValid(dst, src []byte, escape bool) []byte {
+	start := 0
+	for i := 0; i < len(src); {
+		c := src[i]
+		switch {
+		case c == '"':
+			end := skipString(src, i)
+			if escape {
+				dst = append(dst, src[start:i]...)
+				dst = appendHTMLEscape(dst, src[i:end])
+				start = end
+			}
+			i = end
+		case isSpace(c):
+			dst = append(dst, src[start:i]...)
+			i++
+			start = i
+		default:
+			i++
+		}
+	}
+	return append(dst, src[start:]...)
+}
+
+// Indent appends to dst an indented form of the JSON-encoded src.
 func Indent(dst *bytes.Buffer, src []byte, prefix, indent string) error {
-	if !Valid(src) {
-		return syntaxErr("invalid json", 0)
+	if !valid(src) {
+		return stdSyntaxError(src, 0, true)
 	}
-	var level int
-	var inStr, esc bool
-	for i, c := range src {
-		_ = i
-		if inStr {
-			dst.WriteByte(c)
-			if esc {
-				esc = false
-			} else if c == '\\' {
-				esc = true
-			} else if c == '"' {
-				inStr = false
-			}
-			continue
-		}
-		switch c {
-		case ' ', '\n', '\r', '\t':
-			continue
-		case '"':
-			inStr = true
-			dst.WriteByte(c)
-		case '{', '[':
-			dst.WriteByte(c)
-			level++
-			dst.WriteByte('\n')
-			writeIndent(dst, prefix, indent, level)
-		case '}', ']':
-			level--
-			dst.WriteByte('\n')
-			writeIndent(dst, prefix, indent, level)
-			dst.WriteByte(c)
-		case ',':
-			dst.WriteByte(c)
-			dst.WriteByte('\n')
-			writeIndent(dst, prefix, indent, level)
-		case ':':
-			dst.WriteString(": ")
-		default:
-			dst.WriteByte(c)
-		}
-	}
+	dst.Grow(2 * len(src))
+	dst.Write(appendIndentValid(dst.AvailableBuffer(), src, prefix, indent))
 	return nil
 }
-func writeIndent(dst *bytes.Buffer, prefix, indent string, level int) {
-	dst.WriteString(prefix)
-	for i := 0; i < level; i++ {
-		dst.WriteString(indent)
+
+func appendNewline(dst []byte, prefix, indent string, depth int) []byte {
+	dst = append(dst, '\n')
+	dst = append(dst, prefix...)
+	for i := 0; i < depth; i++ {
+		dst = append(dst, indent...)
 	}
+	return dst
 }
-func HTMLEscape(dst *bytes.Buffer, src []byte) {
-	for _, c := range src {
+
+// appendIndentValid indents src, which must be valid JSON, exactly like
+// encoding/json.Indent: leading space is dropped, trailing space is kept and
+// empty arrays and objects stay on one line.
+func appendIndentValid(dst, src []byte, prefix, indent string) []byte {
+	i := skipSpace(src, 0)
+	needIndent := false
+	depth := 0
+	for i < len(src) {
+		c := src[i]
+		if isSpace(c) {
+			i++
+			continue
+		}
+		if needIndent && c != '}' && c != ']' {
+			needIndent = false
+			depth++
+			dst = appendNewline(dst, prefix, indent, depth)
+		}
 		switch c {
-		case '<':
-			dst.WriteString(`\u003c`)
-		case '>':
-			dst.WriteString(`\u003e`)
-		case '&':
-			dst.WriteString(`\u0026`)
+		case '"':
+			end := skipString(src, i)
+			dst = append(dst, src[i:end]...)
+			i = end
+		case '{', '[':
+			needIndent = true
+			dst = append(dst, c)
+			i++
+		case ',':
+			dst = append(dst, c)
+			dst = appendNewline(dst, prefix, indent, depth)
+			i++
+		case ':':
+			dst = append(dst, c, ' ')
+			i++
+		case '}', ']':
+			if needIndent {
+				// suppress indent in empty object/array
+				needIndent = false
+			} else {
+				depth--
+				dst = appendNewline(dst, prefix, indent, depth)
+			}
+			dst = append(dst, c)
+			i++
 		default:
-			dst.WriteByte(c)
+			j := i + 1
+			for j < len(src) {
+				if d := src[j]; isSpace(d) || d == ',' || d == ':' || d == '}' || d == ']' {
+					break
+				}
+				j++
+			}
+			dst = append(dst, src[i:j]...)
+			i = j
+		}
+		if depth == 0 && !needIndent {
+			// The top-level value is complete; trailing space is preserved.
+			return append(dst, src[i:]...)
 		}
 	}
+	return dst
+}
+
+// HTMLEscape appends to dst the JSON-encoded src with <, >, &, U+2028 and
+// U+2029 characters inside string literals changed to \u003c, \u003e,
+// \u0026, \u2028, \u2029.
+func HTMLEscape(dst *bytes.Buffer, src []byte) {
+	dst.Grow(len(src))
+	dst.Write(appendHTMLEscape(dst.AvailableBuffer(), src))
 }

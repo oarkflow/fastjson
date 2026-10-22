@@ -1,439 +1,443 @@
 package fastjson
 
 import (
+	"encoding/binary"
+	stdjson "encoding/json"
+	"math"
+	"math/bits"
+	"strconv"
+	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
+	"unsafe"
 )
 
-var hex = "0123456789abcdef"
+const hex = "0123456789abcdef"
 
-// escapeTable[c] is true for JSON characters that need escaping in strings
-var escapeTable [256]bool
-var escapeTableHTML [256]bool
-
-func init() {
-	for c := 0; c < 0x20; c++ {
-		escapeTable[c] = true
-		escapeTableHTML[c] = true
+// invalidUTF8Repl replaces each invalid UTF-8 byte when encoding strings.
+// Classic encoding/json writes the \ufffd escape while the
+// encoding/json/v2-backed implementation (GOEXPERIMENT=jsonv2, the default
+// in recent Go releases) writes a raw U+FFFD; it is taken from the linked
+// encoding/json so output stays byte-identical.
+var invalidUTF8Repl = func() string {
+	if b, err := stdjson.Marshal("\xff"); err == nil && len(b) > 2 {
+		return string(b[1 : len(b)-1])
 	}
-	escapeTable['\\'] = true
-	escapeTable['"'] = true
-	escapeTableHTML['\\'] = true
-	escapeTableHTML['"'] = true
-	escapeTableHTML['<'] = true
-	escapeTableHTML['>'] = true
-	escapeTableHTML['&'] = true
-}
+	return `\ufffd`
+}()
 
-func appendString(dst []byte, s string, html bool) []byte {
-	dst = append(dst, '"')
-	if html {
-		return appendStringHTML(dst, s)
+// htmlSafe and safe report, for ASCII bytes, whether the byte can be copied
+// verbatim into a JSON string (with and without HTML escaping).
+var safeSet, htmlSafeSet = func() (safe, html [utf8.RuneSelf]bool) {
+	for c := 0x20; c < utf8.RuneSelf; c++ {
+		if c == '"' || c == '\\' {
+			continue
+		}
+		safe[c] = true
+		html[c] = c != '<' && c != '>' && c != '&'
 	}
-	return appendStringPlain(dst, s)
-}
+	return
+}()
 
-func appendStringPlain(dst []byte, s string) []byte {
-	start := 0
-	n := len(s)
-	for start < n {
-		i := start
-		for i < n && !escapeTable[s[i]] {
-			i++
+// escapeIndex returns the index of the first byte in s at or after i that
+// cannot be copied verbatim (control, quote, backslash, non-ASCII, and the
+// HTML characters when html is set).
+func escapeIndex(s string, i int, html bool) int {
+	for i+8 <= len(s) {
+		w := binary.LittleEndian.Uint64(unsafeStringBytes(s[i : i+8]))
+		m := hasLess(w, 0x20) | hasByte(w, '"') | hasByte(w, '\\') | (w & msb)
+		if html {
+			m |= hasByte(w, '<') | hasByte(w, '>') | hasByte(w, '&')
 		}
-		if i > start {
-			dst = append(dst, s[start:i]...)
+		if m != 0 {
+			return i + bits.TrailingZeros64(m)/8
 		}
-		if i >= n {
-			break
-		}
+		i += 8
+	}
+	for i < len(s) {
 		c := s[i]
-		switch c {
-		case '\\', '"':
-			dst = append(dst, '\\', c)
-		case '\n':
-			dst = append(dst, '\\', 'n')
-		case '\r':
-			dst = append(dst, '\\', 'r')
-		case '\t':
-			dst = append(dst, '\\', 't')
-		case '\b':
-			dst = append(dst, '\\', 'b')
-		case '\f':
-			dst = append(dst, '\\', 'f')
-		default:
-			dst = append(dst, "\\u00"...)
-			dst = append(dst, hex[c>>4], hex[c&0x0f])
-		}
-		start = i + 1
-	}
-	dst = append(dst, '"')
-	return dst
-}
-
-func appendStringHTML(dst []byte, s string) []byte {
-	start := 0
-	n := len(s)
-	for start < n {
-		// bulk-scan using lookup table
-		i := start
-		for i < n && !escapeTableHTML[s[i]] {
-			i++
-		}
-		if i > start {
-			dst = append(dst, s[start:i]...)
-		}
-		if i >= n {
-			break
-		}
-		c := s[i]
-		switch c {
-		case '\\', '"':
-			dst = append(dst, '\\', c)
-		case '\n':
-			dst = append(dst, '\\', 'n')
-		case '\r':
-			dst = append(dst, '\\', 'r')
-		case '\t':
-			dst = append(dst, '\\', 't')
-		case '\b':
-			dst = append(dst, '\\', 'b')
-		case '\f':
-			dst = append(dst, '\\', 'f')
-		case '<':
-			dst = append(dst, `\u003c`...)
-		case '>':
-			dst = append(dst, `\u003e`...)
-		case '&':
-			dst = append(dst, `\u0026`...)
-		default:
-			dst = append(dst, "\\u00"...)
-			dst = append(dst, hex[c>>4], hex[c&0x0f])
-		}
-		start = i + 1
-	}
-	dst = append(dst, '"')
-	return dst
-}
-
-// parseString fully parses a JSON string, handling escapes and Unicode.
-func parseString(b []byte, i int) (string, int, error) {
-	if i >= len(b) || b[i] != '"' {
-		return "", i, syntaxErr("expected string", i)
-	}
-	i++
-	start := i
-	for i < len(b) {
-		c := b[i]
-		if c == '"' {
-			return string(b[start:i]), i + 1, nil
-		}
-		if c == '\\' || c < 0x20 || c >= 0x80 {
-			break
+		if c >= utf8.RuneSelf || !safeSet[c] || (html && !htmlSafeSet[c]) {
+			return i
 		}
 		i++
 	}
-	out := make([]byte, 0, len(b)-start)
-	out = append(out, b[start:i]...)
-	for i < len(b) {
-		c := b[i]
-		if c == '"' {
-			return string(out), i + 1, nil
-		}
-		if c < 0x20 {
-			return "", i, syntaxErr("bad control in string", i)
-		}
-		if c == '\\' {
-			i++
-			if i >= len(b) {
-				return "", i, syntaxErr("bad escape", i)
+	return i
+}
+
+func unsafeStringBytes(s string) []byte {
+	return unsafe.Slice(unsafe.StringData(s), len(s))
+}
+
+// appendString appends the JSON encoding of s exactly as encoding/json does:
+// invalid UTF-8 is replaced (see invalidUTF8Repl) and U+2028/U+2029 are escaped.
+func appendString(dst []byte, s string, html bool) []byte {
+	dst = append(dst, '"')
+	start := 0
+	i := escapeIndex(s, 0, html)
+	for i < len(s) {
+		b := s[i]
+		if b < utf8.RuneSelf {
+			if htmlSafeSet[b] || (!html && safeSet[b]) {
+				i++
+				continue
 			}
-			switch b[i] {
-			case '"', '\\', '/':
-				out = append(out, b[i])
-				i++
-			case 'b':
-				out = append(out, '\b')
-				i++
-			case 'f':
-				out = append(out, '\f')
-				i++
-			case 'n':
-				out = append(out, '\n')
-				i++
-			case 'r':
-				out = append(out, '\r')
-				i++
-			case 't':
-				out = append(out, '\t')
-				i++
-			case 'u':
-				if i+4 >= len(b) {
-					return "", i, syntaxErr("bad unicode escape", i)
-				}
-				r := rune(0)
-				for k := 1; k <= 4; k++ {
-					x := b[i+k]
-					var v byte
-					switch {
-					case x >= '0' && x <= '9':
-						v = x - '0'
-					case x >= 'a' && x <= 'f':
-						v = x - 'a' + 10
-					case x >= 'A' && x <= 'F':
-						v = x - 'A' + 10
-					default:
-						return "", i, syntaxErr("bad unicode escape", i)
-					}
-					r = r*16 + rune(v)
-				}
-				if utf16.IsSurrogate(r) {
-					if i+6 < len(b) && b[i+5] == '\\' && b[i+6] == 'u' {
-						r2 := rune(0)
-						for k := 7; k <= 10; k++ {
-							if k >= len(b) {
-								return "", i, syntaxErr("bad unicode escape", i)
-							}
-							x := b[i+k]
-							var v byte
-							switch {
-							case x >= '0' && x <= '9':
-								v = x - '0'
-							case x >= 'a' && x <= 'f':
-								v = x - 'a' + 10
-							case x >= 'A' && x <= 'F':
-								v = x - 'A' + 10
-							default:
-								return "", i, syntaxErr("bad unicode escape", i)
-							}
-							r2 = r2*16 + rune(v)
-						}
-						if utf16.IsSurrogate(r2) {
-							r = utf16.DecodeRune(r, r2)
-							i += 11
-							out = append(out, string(r)...)
-							continue
-						}
-					}
-					return "", i, syntaxErr("bad unicode surrogate pair", i)
-				}
-				out = append(out, string(r)...)
-				i += 5
+			dst = append(dst, s[start:i]...)
+			switch b {
+			case '\\', '"':
+				dst = append(dst, '\\', b)
+			case '\b':
+				dst = append(dst, '\\', 'b')
+			case '\f':
+				dst = append(dst, '\\', 'f')
+			case '\n':
+				dst = append(dst, '\\', 'n')
+			case '\r':
+				dst = append(dst, '\\', 'r')
+			case '\t':
+				dst = append(dst, '\\', 't')
 			default:
-				return "", i, syntaxErr("bad escape", i)
+				dst = append(dst, '\\', 'u', '0', '0', hex[b>>4], hex[b&0xF])
 			}
-			continue
-		}
-		if c < utf8.RuneSelf {
-			out = append(out, c)
 			i++
+			start = i
+			i = escapeIndex(s, i, html)
 			continue
 		}
-		r, n := utf8.DecodeRune(b[i:])
-		if r == utf8.RuneError && n == 1 {
-			return "", i, syntaxErr("bad utf8", i)
+		c, size := utf8.DecodeRuneInString(s[i:])
+		if c == utf8.RuneError && size == 1 {
+			dst = append(dst, s[start:i]...)
+			dst = append(dst, invalidUTF8Repl...)
+			i += size
+			start = i
+			continue
 		}
-		out = append(out, b[i:i+n]...)
-		i += n
+		if c == '\u2028' || c == '\u2029' {
+			dst = append(dst, s[start:i]...)
+			dst = append(dst, '\\', 'u', '2', '0', '2', hex[c&0xF])
+			i += size
+			start = i
+			continue
+		}
+		i += size
 	}
-	return "", i, syntaxErr("unterminated string", i)
+	dst = append(dst, s[start:]...)
+	return append(dst, '"')
 }
 
-func parseStringZC(b []byte, i int) (string, int, error) {
-	if i >= len(b) || b[i] != '"' {
-		return "", i, syntaxErr("expected string", i)
+// appendFloat formats f exactly like encoding/json's float encoder. The
+// caller must reject NaN and infinities.
+func appendFloat(b []byte, f float64, bitSize int) []byte {
+	abs := math.Abs(f)
+	format := byte('f')
+	if abs != 0 {
+		if bitSize == 64 && (abs < 1e-6 || abs >= 1e21) || bitSize == 32 && (float32(abs) < 1e-6 || float32(abs) >= 1e21) {
+			format = 'e'
+		}
 	}
-	start := i + 1
-	j := start
-	n := len(b)
-	for j+7 < n {
-		if b[j] == '"' {
-			return emptyOrUnsafe(b, start, j), j + 1, nil
+	b = strconv.AppendFloat(b, f, format, -1, bitSize)
+	if format == 'e' {
+		// clean up e-09 to e-9
+		n := len(b)
+		if n >= 4 && b[n-4] == 'e' && b[n-3] == '-' && b[n-2] == '0' {
+			b[n-2] = b[n-1]
+			b = b[:n-1]
 		}
-		if escapeTable[b[j]] {
-			return parseStringFallback(b, i, start, j)
-		}
-		if b[j+1] == '"' {
-			return emptyOrUnsafe(b, start, j+1), j + 2, nil
-		}
-		if escapeTable[b[j+1]] {
-			return parseStringFallback(b, i, start, j+1)
-		}
-		if b[j+2] == '"' {
-			return emptyOrUnsafe(b, start, j+2), j + 3, nil
-		}
-		if escapeTable[b[j+2]] {
-			return parseStringFallback(b, i, start, j+2)
-		}
-		if b[j+3] == '"' {
-			return emptyOrUnsafe(b, start, j+3), j + 4, nil
-		}
-		if escapeTable[b[j+3]] {
-			return parseStringFallback(b, i, start, j+3)
-		}
-		if b[j+4] == '"' {
-			return emptyOrUnsafe(b, start, j+4), j + 5, nil
-		}
-		if escapeTable[b[j+4]] {
-			return parseStringFallback(b, i, start, j+4)
-		}
-		if b[j+5] == '"' {
-			return emptyOrUnsafe(b, start, j+5), j + 6, nil
-		}
-		if escapeTable[b[j+5]] {
-			return parseStringFallback(b, i, start, j+5)
-		}
-		if b[j+6] == '"' {
-			return emptyOrUnsafe(b, start, j+6), j + 7, nil
-		}
-		if escapeTable[b[j+6]] {
-			return parseStringFallback(b, i, start, j+6)
-		}
-		if b[j+7] == '"' {
-			return emptyOrUnsafe(b, start, j+7), j + 8, nil
-		}
-		if escapeTable[b[j+7]] {
-			return parseStringFallback(b, i, start, j+7)
-		}
-		j += 8
 	}
-	for j < n {
-		if b[j] == '"' {
-			return emptyOrUnsafe(b, start, j), j + 1, nil
-		}
-		if escapeTable[b[j]] {
-			return parseStringFallback(b, i, start, j)
-		}
-		j++
-	}
-	for j < n {
-		c := b[j]
-		if c == '"' {
-			return emptyOrUnsafe(b, start, j), j + 1, nil
-		}
-		if escapeTable[c] {
-			return parseStringFallback(b, i, start, j)
-		}
-		j++
-	}
-	return "", j, syntaxErr("unterminated string", i)
+	return b
 }
 
-func emptyOrUnsafe(b []byte, start, end int) string {
-	if end == start {
-		return ""
-	}
-	return unsafeString(b[start:end])
-}
+// String scanning for the decoder. Input has already been validated.
 
-func parseStringFallback(b []byte, origOff int, start, end int) (string, int, error) {
-	if end == start {
-		return parseString(b, origOff)
-	}
-	out := make([]byte, 0, len(b)-start)
-	out = append(out, b[start:end]...)
-	i := end
-	n := len(b)
-	for i < n {
+const (
+	strEscaped  = 1 << iota // contains a backslash escape
+	strNonASCII             // contains bytes >= 0x80
+)
+
+// scanStringFlags returns the index of the closing quote of the string whose
+// opening quote is at b[i], plus flags describing its content.
+func scanStringFlags(b []byte, i int) (int, uint8) {
+	var flags uint8
+	i++
+	for {
+		for i+8 <= len(b) {
+			w := binary.LittleEndian.Uint64(b[i:])
+			m := hasByte(w, '"') | hasByte(w, '\\')
+			if flags&strNonASCII == 0 {
+				m |= w & msb
+			}
+			if m != 0 {
+				i += bits.TrailingZeros64(m) / 8
+				break
+			}
+			i += 8
+		}
 		c := b[i]
-		if c == '"' {
-			return string(out), i + 1, nil
-		}
-		if c < 0x20 {
-			return "", i, syntaxErr("bad control in string", i)
-		}
-		if c == '\\' {
+		switch {
+		case c == '"':
+			return i, flags
+		case c == '\\':
+			flags |= strEscaped
+			i += 2
+		case c >= utf8.RuneSelf:
+			flags |= strNonASCII
 			i++
-			if i >= n {
-				return "", i, syntaxErr("bad escape", i)
-			}
-			switch b[i] {
-			case '"', '\\', '/':
-				out = append(out, b[i])
-				i++
-			case 'b':
-				out = append(out, '\b')
-				i++
-			case 'f':
-				out = append(out, '\f')
-				i++
-			case 'n':
-				out = append(out, '\n')
-				i++
-			case 'r':
-				out = append(out, '\r')
-				i++
-			case 't':
-				out = append(out, '\t')
-				i++
-			case 'u':
-				if i+4 >= n {
-					return "", i, syntaxErr("bad unicode escape", i)
-				}
-				r := rune(0)
-				for k := 1; k <= 4; k++ {
-					x := b[i+k]
-					var v byte
-					switch {
-					case x >= '0' && x <= '9':
-						v = x - '0'
-					case x >= 'a' && x <= 'f':
-						v = x - 'a' + 10
-					case x >= 'A' && x <= 'F':
-						v = x - 'A' + 10
-					default:
-						return "", i, syntaxErr("bad unicode escape", i)
-					}
-					r = r*16 + rune(v)
-				}
-				if utf16.IsSurrogate(r) {
-					if i+6 < n && b[i+5] == '\\' && b[i+6] == 'u' {
-						r2 := rune(0)
-						for k := 7; k <= 10; k++ {
-							if k >= n {
-								return "", i, syntaxErr("bad unicode escape", i)
-							}
-							x := b[i+k]
-							var v byte
-							switch {
-							case x >= '0' && x <= '9':
-								v = x - '0'
-							case x >= 'a' && x <= 'f':
-								v = x - 'a' + 10
-							case x >= 'A' && x <= 'F':
-								v = x - 'A' + 10
-							default:
-								return "", i, syntaxErr("bad unicode escape", i)
-							}
-							r2 = r2*16 + rune(v)
-						}
-						if utf16.IsSurrogate(r2) {
-							r = utf16.DecodeRune(r, r2)
-							i += 11
-							out = append(out, string(r)...)
-							continue
-						}
-					}
-					return "", i, syntaxErr("bad unicode surrogate pair", i)
-				}
-				out = append(out, string(r)...)
-				i += 5
-			default:
-				return "", i, syntaxErr("bad escape", i)
-			}
-			continue
-		}
-		if c < utf8.RuneSelf {
-			out = append(out, c)
+		default:
 			i++
-			continue
 		}
-		r, rn := utf8.DecodeRune(b[i:])
-		if r == utf8.RuneError && rn == 1 {
-			return "", i, syntaxErr("bad utf8", i)
-		}
-		out = append(out, b[i:i+rn]...)
-		i += rn
 	}
-	return "", i, syntaxErr("unterminated string", i)
+}
+
+// skipString returns the offset just past the string starting at b[i].
+func skipString(b []byte, i int) int {
+	i++
+	for {
+		for i+8 <= len(b) {
+			w := binary.LittleEndian.Uint64(b[i:])
+			if m := hasByte(w, '"') | hasByte(w, '\\'); m != 0 {
+				i += bits.TrailingZeros64(m) / 8
+				break
+			}
+			i += 8
+		}
+		switch b[i] {
+		case '"':
+			return i + 1
+		case '\\':
+			i += 2
+		default:
+			i++
+		}
+	}
+}
+
+// unquoteInto appends the decoded content of the raw string body s (without
+// quotes) to dst, following encoding/json: invalid UTF-8 and unpaired
+// surrogates become U+FFFD.
+func unquoteInto(dst, s []byte) []byte {
+	r := 0
+	for r < len(s) {
+		c := s[r]
+		switch {
+		case c == '\\':
+			r++
+			switch s[r] {
+			case '"', '\\', '/', '\'':
+				dst = append(dst, s[r])
+				r++
+			case 'b':
+				dst = append(dst, '\b')
+				r++
+			case 'f':
+				dst = append(dst, '\f')
+				r++
+			case 'n':
+				dst = append(dst, '\n')
+				r++
+			case 'r':
+				dst = append(dst, '\r')
+				r++
+			case 't':
+				dst = append(dst, '\t')
+				r++
+			case 'u':
+				r--
+				rr := getu4(s[r:])
+				r += 6
+				if utf16.IsSurrogate(rr) {
+					rr1 := getu4(s[r:])
+					if dec := utf16.DecodeRune(rr, rr1); dec != unicode.ReplacementChar {
+						r += 6
+						dst = utf8.AppendRune(dst, dec)
+						break
+					}
+					rr = unicode.ReplacementChar
+				}
+				dst = utf8.AppendRune(dst, rr)
+			}
+		case c < utf8.RuneSelf:
+			start := r
+			for r < len(s) && s[r] < utf8.RuneSelf && s[r] != '\\' {
+				r++
+			}
+			dst = append(dst, s[start:r]...)
+		default:
+			rr, size := utf8.DecodeRune(s[r:])
+			if rr == utf8.RuneError && size == 1 {
+				dst = append(dst, "\uFFFD"...)
+			} else {
+				dst = append(dst, s[r:r+size]...)
+			}
+			r += size
+		}
+	}
+	return dst
+}
+
+func getu4(s []byte) rune {
+	if len(s) < 6 || s[0] != '\\' || s[1] != 'u' {
+		return -1
+	}
+	var r rune
+	for _, c := range s[2:6] {
+		switch {
+		case '0' <= c && c <= '9':
+			c = c - '0'
+		case 'a' <= c && c <= 'f':
+			c = c - 'a' + 10
+		case 'A' <= c && c <= 'F':
+			c = c - 'A' + 10
+		default:
+			return -1
+		}
+		r = r*16 + rune(c)
+	}
+	return r
+}
+
+// numberEnd returns the offset just past the number starting at b[i].
+func numberEnd(b []byte, i int) int {
+	for i < len(b) && charClass[b[i]]&ccNumChar != 0 {
+		i++
+	}
+	return i
+}
+
+// parseInt parses a JSON number literal as an int64 with the same
+// acceptance rules as strconv.ParseInt(s, 10, 64).
+func parseInt(b []byte) (int64, bool) {
+	neg := false
+	i := 0
+	if len(b) > 0 && b[0] == '-' {
+		neg = true
+		i = 1
+	}
+	if i >= len(b) || len(b)-i > 19 {
+		n, err := strconv.ParseInt(unsafeString(b), 10, 64)
+		return n, err == nil
+	}
+	var n uint64
+	for ; i < len(b); i++ {
+		c := b[i] - '0'
+		if c > 9 {
+			return 0, false
+		}
+		n = n*10 + uint64(c)
+	}
+	if neg {
+		if n > 1<<63 {
+			return 0, false
+		}
+		return -int64(n), true
+	}
+	if n > math.MaxInt64 {
+		return 0, false
+	}
+	return int64(n), true
+}
+
+// parseUint parses like strconv.ParseUint(s, 10, 64).
+func parseUint(b []byte) (uint64, bool) {
+	if len(b) == 0 || len(b) > 19 {
+		n, err := strconv.ParseUint(unsafeString(b), 10, 64)
+		return n, err == nil
+	}
+	var n uint64
+	for _, c := range b {
+		c -= '0'
+		if c > 9 {
+			return 0, false
+		}
+		n = n*10 + uint64(c)
+	}
+	return n, true
+}
+
+var float64pow10 = [...]float64{
+	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
+	1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
+	1e20, 1e21, 1e22,
+}
+
+var float32pow10 = [...]float32{1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10}
+
+// decimalParts splits a JSON number literal into a mantissa and a decimal
+// exponent. ok is false when the mantissa does not fit in 19 digits or the
+// exponent is out of the fast-path range.
+func decimalParts(b []byte) (mant uint64, exp int, neg, ok bool) {
+	i := 0
+	if b[0] == '-' {
+		neg = true
+		i++
+	}
+	nd := 0
+	for ; i < len(b) && b[i] >= '0' && b[i] <= '9'; i++ {
+		if nd > 0 || b[i] != '0' {
+			nd++
+		}
+		mant = mant*10 + uint64(b[i]-'0')
+	}
+	if i < len(b) && b[i] == '.' {
+		i++
+		for ; i < len(b) && b[i] >= '0' && b[i] <= '9'; i++ {
+			if nd > 0 || b[i] != '0' {
+				nd++
+			}
+			mant = mant*10 + uint64(b[i]-'0')
+			exp--
+		}
+	}
+	if nd > 19 {
+		return 0, 0, neg, false
+	}
+	if i < len(b) {
+		i++ // 'e' or 'E'
+		esign := 1
+		if b[i] == '+' {
+			i++
+		} else if b[i] == '-' {
+			esign = -1
+			i++
+		}
+		e := 0
+		for ; i < len(b); i++ {
+			if e > 1000 {
+				return 0, 0, neg, false
+			}
+			e = e*10 + int(b[i]-'0')
+		}
+		exp += esign * e
+	}
+	return mant, exp, neg, true
+}
+
+// parseFloat parses a JSON number literal like strconv.ParseFloat, using an
+// exact fast path for the common case of short decimals.
+func parseFloat(b []byte, bitSize int) (float64, error) {
+	if mant, exp, neg, ok := decimalParts(b); ok {
+		if bitSize == 64 && mant < 1<<53 && exp >= -22 && exp <= 22 {
+			f := float64(mant)
+			if exp < 0 {
+				f /= float64pow10[-exp]
+			} else {
+				f *= float64pow10[exp]
+			}
+			if neg {
+				f = -f
+			}
+			return f, nil
+		}
+		if bitSize == 32 && mant < 1<<24 && exp >= -10 && exp <= 10 {
+			f := float32(mant)
+			if exp < 0 {
+				f /= float32pow10[-exp]
+			} else {
+				f *= float32pow10[exp]
+			}
+			if neg {
+				f = -f
+			}
+			return float64(f), nil
+		}
+	}
+	return strconv.ParseFloat(unsafeString(b), bitSize)
 }

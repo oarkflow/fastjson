@@ -2,8 +2,8 @@ package fastjson
 
 import (
 	"bytes"
-	"errors"
 	stdjson "encoding/json"
+	"errors"
 	"io"
 	"math"
 	"reflect"
@@ -112,23 +112,23 @@ func TestAccuracyValidMatchesStdlib(t *testing.T) {
 }
 
 type AllTypes struct {
-	A  int      `json:"a"`
-	B  int8     `json:"b"`
-	C  int16    `json:"c"`
-	D  int32    `json:"d"`
-	E  int64    `json:"e"`
-	F  uint     `json:"f"`
-	G  uint8    `json:"g"`
-	H  uint16   `json:"h"`
-	I  uint32   `json:"i"`
-	J  uint64   `json:"j"`
-	K  float32  `json:"k"`
-	L  float64  `json:"l"`
-	M  bool     `json:"m"`
-	N  string   `json:"n"`
-	O  []string `json:"o"`
-	P  []int    `json:"p"`
-	Q  string   `json:"-"`
+	A int      `json:"a"`
+	B int8     `json:"b"`
+	C int16    `json:"c"`
+	D int32    `json:"d"`
+	E int64    `json:"e"`
+	F uint     `json:"f"`
+	G uint8    `json:"g"`
+	H uint16   `json:"h"`
+	I uint32   `json:"i"`
+	J uint64   `json:"j"`
+	K float32  `json:"k"`
+	L float64  `json:"l"`
+	M bool     `json:"m"`
+	N string   `json:"n"`
+	O []string `json:"o"`
+	P []int    `json:"p"`
+	Q string   `json:"-"`
 }
 
 func TestAllNumericTypesMarshalUnmarshal(t *testing.T) {
@@ -192,7 +192,7 @@ func TestNullablePointerFields(t *testing.T) {
 	}
 }
 
-func TestOmitEmpty(t *testing.T) {
+func TestAccuracyOmitEmpty(t *testing.T) {
 	type S struct {
 		A string  `json:"a,omitempty"`
 		B int     `json:"b,omitempty"`
@@ -350,7 +350,7 @@ func TestIndentMatchesStdlib(t *testing.T) {
 	}
 }
 
-func TestHTMLEscape(t *testing.T) {
+func TestAccuracyHTMLEscape(t *testing.T) {
 	src := []byte(`{"x":"<hello> & world"}`)
 	var ourBuf, stdBuf bytes.Buffer
 	HTMLEscape(&ourBuf, src)
@@ -371,11 +371,16 @@ func TestHTMLEscapeMarshalDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(b, []byte(`\u003c`)) {
-		t.Fatalf("Marshal should NOT escape HTML by default, got: %s", b)
+	want, _ := stdjson.Marshal(v)
+	if !bytes.Equal(b, want) {
+		t.Fatalf("Marshal should escape HTML like encoding/json: got %s want %s", b, want)
+	}
+	b, err = MarshalNoEscape(v)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if !bytes.Contains(b, []byte(`<hidden>`)) {
-		t.Fatalf("Marshal should contain raw <hidden>, got: %s", b)
+		t.Fatalf("MarshalNoEscape should contain raw <hidden>, got: %s", b)
 	}
 }
 
@@ -396,14 +401,14 @@ func TestHTMLEscapeMarshalEscape(t *testing.T) {
 func TestHTMLEscapeEncoderToggle(t *testing.T) {
 	v := HTMLStruct{Name: "test", Value: "<hidden>"}
 
-	// Default: no HTML escape
+	// Default: HTML escaped, as with encoding/json
 	var buf1 bytes.Buffer
 	enc1 := NewEncoder(&buf1)
 	if err := enc1.Encode(v); err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(buf1.Bytes(), []byte(`\u003c`)) {
-		t.Fatalf("Encoder default should NOT escape HTML, got: %s", buf1.String())
+	if !bytes.Contains(buf1.Bytes(), []byte(`\u003c`)) {
+		t.Fatalf("Encoder default should escape HTML, got: %s", buf1.String())
 	}
 
 	// SetEscapeHTML(true): should escape
@@ -453,13 +458,13 @@ func TestHTMLEscapeAppenderToggle(t *testing.T) {
 func TestHTMLEscapeMapAndSlice(t *testing.T) {
 	m := map[string]string{"key": "<hidden>"}
 
-	// Default Marshal: no escape
-	b, err := Marshal(m)
+	// MarshalNoEscape: no escape
+	b, err := MarshalNoEscape(m)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Contains(b, []byte(`\u003c`)) {
-		t.Fatalf("Marshal map should NOT escape HTML by default, got: %s", b)
+		t.Fatalf("MarshalNoEscape map should NOT escape HTML, got: %s", b)
 	}
 
 	// MarshalEscape: escape
@@ -473,12 +478,12 @@ func TestHTMLEscapeMapAndSlice(t *testing.T) {
 
 	// Slice
 	s := []string{"<hidden>"}
-	b3, err := Marshal(s)
+	b3, err := MarshalNoEscape(s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Contains(b3, []byte(`\u003c`)) {
-		t.Fatalf("Marshal slice should NOT escape HTML by default, got: %s", b3)
+		t.Fatalf("MarshalNoEscape slice should NOT escape HTML, got: %s", b3)
 	}
 
 	b4, err := MarshalEscape(s)
@@ -516,7 +521,7 @@ func TestEncoderDecoderStreaming(t *testing.T) {
 	}
 }
 
-func TestRawMessage(t *testing.T) {
+func TestAccuracyRawMessage(t *testing.T) {
 	src := []byte(`{"raw":{"a":1},"normal":42}`)
 	var got struct {
 		Raw    RawMessage `json:"raw"`
@@ -590,12 +595,40 @@ func TestMapStringAny(t *testing.T) {
 
 func TestErrorMessages(t *testing.T) {
 	var se *SyntaxError
-	if !errors.As(syntaxErr("test", 5), &se) {
+	if !errors.As(newSyntaxError("test", 5), &se) {
 		t.Fatal("expected SyntaxError")
 	}
-	if se.Offset != 5 {
-		t.Fatalf("offset: got %d want 5", se.Offset)
+	if se.Offset != 5 || se.Error() != "test" {
+		t.Fatalf("got %q at %d, want %q at 5", se.Error(), se.Offset, "test")
 	}
+	// The error from a real syntax problem must match encoding/json exactly.
+	in := []byte(`{"a": tru}`)
+	err := Unmarshal(in, new(any))
+	stdErr := stdjson.Unmarshal(in, new(any))
+	var stdSE *stdjson.SyntaxError
+	if !errors.As(err, &se) || !errors.As(stdErr, &stdSE) {
+		t.Fatalf("expected *json.SyntaxError, got %T and %T", err, stdErr)
+	}
+	if se.Error() != stdSE.Error() || se.Offset != stdSE.Offset {
+		t.Fatalf("got %q at %d, want %q at %d", se, se.Offset, stdSE, stdSE.Offset)
+	}
+}
+
+// Test helpers standing in for parsers that used to be internal.
+func parseString(b []byte, _ int) (string, int, error) {
+	var s string
+	err := Unmarshal(b, &s)
+	return s, len(b), err
+}
+
+func parseIntBytes(b []byte) (int64, error) {
+	var n int64
+	return n, Unmarshal(b, &n)
+}
+
+func parseUintBytes(b []byte) (uint64, error) {
+	var n uint64
+	return n, Unmarshal(b, &n)
 }
 
 func TestLargeIntegerValues(t *testing.T) {

@@ -1,463 +1,426 @@
 package fastjson
 
 import (
-	"fmt"
-	"strconv"
-	"unsafe"
+	"encoding/binary"
+	"math/bits"
+	"sync"
 )
 
-type SyntaxError struct {
-	msg    string
-	Offset int64
-}
+const maxNestingDepth = 10000
 
-func (e *SyntaxError) Error() string {
-	return fmt.Sprintf("fastjson: %s at byte offset %d", e.msg, e.Offset)
-}
-func syntaxErr(msg string, off int) error { return &SyntaxError{msg: msg, Offset: int64(off)} }
+// Character classes used by the scanners.
+const (
+	ccSpace = 1 << iota
+	ccDigit
+	ccHex
+	ccNumChar    // digits, '.', 'e', 'E', '+', '-'
+	ccStrSpecial // '"', '\\' and control characters
+)
 
-var wsTab [256]bool
+var charClass = func() (t [256]uint8) {
+	for _, c := range []byte(" \t\r\n") {
+		t[c] |= ccSpace
+	}
+	for c := '0'; c <= '9'; c++ {
+		t[c] |= ccDigit | ccHex | ccNumChar
+	}
+	for c := 'a'; c <= 'f'; c++ {
+		t[c] |= ccHex
+		t[c-'a'+'A'] |= ccHex
+	}
+	for _, c := range []byte(".eE+-") {
+		t[c] |= ccNumChar
+	}
+	t['"'] |= ccStrSpecial
+	t['\\'] |= ccStrSpecial
+	for c := 0; c < 0x20; c++ {
+		t[c] |= ccStrSpecial
+	}
+	return t
+}()
 
-func init() {
-	wsTab[' '] = true
-	wsTab['\n'] = true
-	wsTab['\r'] = true
-	wsTab['\t'] = true
-}
+func isSpace(c byte) bool { return charClass[c]&ccSpace != 0 }
 
-func skipWS(b []byte, i int) int {
-	for i < len(b) && wsTab[b[i]] {
+func skipSpace(b []byte, i int) int {
+	for i < len(b) && charClass[b[i]]&ccSpace != 0 {
 		i++
 	}
 	return i
 }
 
-func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+// SWAR helpers operating on 8 bytes at a time.
+const (
+	lsb = 0x0101010101010101
+	msb = 0x8080808080808080
+)
 
-//go:nosplit
-func valueEnd(b []byte, i int) (int, error) {
-	i = skipWS(b, i)
-	if i >= len(b) {
-		return i, syntaxErr("unexpected eof", i)
-	}
-	switch b[i] {
-	case '"':
-		return stringEnd(b, i)
-	case '{':
-		return objectEnd(b, i)
-	case '[':
-		return arrayEnd(b, i)
-	case 't':
-		if i+4 <= len(b) && b[i+1] == 'r' && b[i+2] == 'u' && b[i+3] == 'e' {
-			return i + 4, nil
-		}
-	case 'f':
-		if i+5 <= len(b) && b[i+1] == 'a' && b[i+2] == 'l' && b[i+3] == 's' && b[i+4] == 'e' {
-			return i + 5, nil
-		}
-	case 'n':
-		if i+4 <= len(b) && b[i+1] == 'u' && b[i+2] == 'l' && b[i+3] == 'l' {
-			return i + 4, nil
-		}
-	default:
-		if b[i] == '-' || isDigit(b[i]) {
-			return numberEnd(b, i)
-		}
-	}
-	return i, syntaxErr("invalid value", i)
-}
+// hasZero returns a word whose high bit is set in the first byte of x that is
+// zero (higher bytes may contain false positives, which callers tolerate).
+func hasZero(x uint64) uint64 { return (x - lsb) & ^x & msb }
 
-func numberEnd(b []byte, i int) (int, error) {
-	start := i
-	if b[i] == '-' {
-		i++
-		if i >= len(b) {
-			return i, syntaxErr("bad number", start)
-		}
-	}
-	if b[i] == '0' {
-		i++
-		if i < len(b) && b[i] >= '0' && b[i] <= '9' {
-			return i, syntaxErr("bad number", i)
-		}
-	} else if b[i] >= '1' && b[i] <= '9' {
-		i++
-		for i < len(b) && b[i] >= '0' && b[i] <= '9' {
-			i++
-		}
-	} else {
-		return i, syntaxErr("bad number", i)
-	}
-	if i < len(b) && b[i] == '.' {
-		i++
-		if i >= len(b) || b[i] < '0' || b[i] > '9' {
-			return i, syntaxErr("bad number", i)
-		}
-		for i < len(b) && b[i] >= '0' && b[i] <= '9' {
-			i++
-		}
-	}
-	if i < len(b) && (b[i] == 'e' || b[i] == 'E') {
-		i++
-		if i < len(b) && (b[i] == '+' || b[i] == '-') {
-			i++
-		}
-		if i >= len(b) || b[i] < '0' || b[i] > '9' {
-			return i, syntaxErr("bad number", i)
-		}
-		for i < len(b) && b[i] >= '0' && b[i] <= '9' {
-			i++
-		}
-	}
-	return i, nil
-}
+func hasByte(x uint64, c byte) uint64 { return hasZero(x ^ (lsb * uint64(c))) }
 
-func objectEnd(b []byte, i int) (int, error) {
-	i++
-	i = skipWS(b, i)
-	if i < len(b) && b[i] == '}' {
-		return i + 1, nil
-	}
-	for {
-		if i >= len(b) || b[i] != '"' {
-			return i, syntaxErr("expected object key", i)
-		}
-		n, err := stringEnd(b, i)
-		if err != nil {
-			return n, err
-		}
-		i = skipWS(b, n)
-		if i >= len(b) || b[i] != ':' {
-			return i, syntaxErr("expected colon", i)
-		}
-		n, err = valueEnd(b, i+1)
-		if err != nil {
-			return n, err
-		}
-		i = skipWS(b, n)
-		if i < len(b) && b[i] == '}' {
-			return i + 1, nil
-		}
-		if i >= len(b) || b[i] != ',' {
-			return i, syntaxErr("expected comma", i)
-		}
-		i = skipWS(b, i+1)
-	}
-}
+// hasLess returns a non-zero word if any byte of x is less than n (n <= 128).
+func hasLess(x uint64, n byte) uint64 { return (x - lsb*uint64(n)) & ^x & msb }
 
-func arrayEnd(b []byte, i int) (int, error) {
-	i++
-	i = skipWS(b, i)
-	if i < len(b) && b[i] == ']' {
-		return i + 1, nil
-	}
-	for {
-		n, err := valueEnd(b, i)
-		if err != nil {
-			return n, err
-		}
-		i = skipWS(b, n)
-		if i < len(b) && b[i] == ']' {
-			return i + 1, nil
-		}
-		if i >= len(b) || b[i] != ',' {
-			return i, syntaxErr("expected comma", i)
-		}
-		i = skipWS(b, i+1)
-	}
-}
-
-func stringEnd(b []byte, i int) (int, error) {
-	if i >= len(b) || b[i] != '"' {
-		return i, syntaxErr("expected string", i)
-	}
-	i++
-	// manual unrolling: scan 8 bytes at a time for common case
-	n := len(b)
-	for i+7 < n {
-		if b[i] == '"' {
-			return i + 1, nil
-		}
-		if b[i] == '\\' || b[i] < 0x20 {
-			goto slow
-		}
-		if b[i+1] == '"' {
-			return i + 2, nil
-		}
-		if b[i+1] == '\\' || b[i+1] < 0x20 {
-			i++
-			goto slow
-		}
-		if b[i+2] == '"' {
-			return i + 3, nil
-		}
-		if b[i+2] == '\\' || b[i+2] < 0x20 {
-			i += 2
-			goto slow
-		}
-		if b[i+3] == '"' {
-			return i + 4, nil
-		}
-		if b[i+3] == '\\' || b[i+3] < 0x20 {
-			i += 3
-			goto slow
-		}
-		if b[i+4] == '"' {
-			return i + 5, nil
-		}
-		if b[i+4] == '\\' || b[i+4] < 0x20 {
-			i += 4
-			goto slow
-		}
-		if b[i+5] == '"' {
-			return i + 6, nil
-		}
-		if b[i+5] == '\\' || b[i+5] < 0x20 {
-			i += 5
-			goto slow
-		}
-		if b[i+6] == '"' {
-			return i + 7, nil
-		}
-		if b[i+6] == '\\' || b[i+6] < 0x20 {
-			i += 6
-			goto slow
-		}
-		if b[i+7] == '"' {
-			return i + 8, nil
-		}
-		if b[i+7] == '\\' || b[i+7] < 0x20 {
-			i += 7
-			goto slow
+// stringSpecial finds the index of the first '"', '\\' or control character
+// at or after b[i] in a JSON string body. It returns len(b) if none is found.
+func stringSpecial(b []byte, i int) int {
+	for i+8 <= len(b) {
+		w := binary.LittleEndian.Uint64(b[i:])
+		if m := hasByte(w, '"') | hasByte(w, '\\') | hasLess(w, 0x20); m != 0 {
+			return i + bits.TrailingZeros64(m)/8
 		}
 		i += 8
 	}
-	for i < n {
-		c := b[i]
-		if c == '"' {
-			return i + 1, nil
-		}
-		if c < 0x20 {
-			return i, syntaxErr("bad control in string", i)
-		}
-		if c == '\\' {
-			goto slow
+	for i < len(b) {
+		if charClass[b[i]]&ccStrSpecial != 0 {
+			return i
 		}
 		i++
 	}
-	return i, syntaxErr("unterminated string", i)
-slow:
-	// handle escape sequences
-	for i < n {
-		c := b[i]
-		if c == '"' {
-			return i + 1, nil
-		}
-		if c < 0x20 {
-			return i, syntaxErr("bad control in string", i)
-		}
-		if c == '\\' {
-			i++
-			if i >= n {
-				return i, syntaxErr("bad escape", i)
+	return i
+}
+
+// Scanner states for valueScanner.
+const (
+	stValue        = iota // expecting a value
+	stValueOrClose        // just after '[': value or ']'
+	stKeyOrClose          // just after '{': key or '}'
+	stKey                 // after ',' in an object: key
+	stColon               // after an object key
+	stCommaOrClose        // after a value inside a container
+)
+
+type scanResult uint8
+
+const (
+	scanDone     scanResult = iota // a complete top-level value was scanned
+	scanNeedMore                   // input ended before the value did
+	scanInvalid                    // input is not valid JSON
+)
+
+// valueScanner is a fast, resumable JSON validator. It only decides validity
+// and where a value ends; exact error messages come from stdScanner, which
+// is run on the error path.
+type valueScanner struct {
+	stack    []byte // open containers: '{' or '['
+	state    uint8
+	inString bool  // suspended inside a string body
+	afterStr uint8 // state to resume after the suspended string
+}
+
+func (s *valueScanner) reset() {
+	s.stack = s.stack[:0]
+	s.state = stValue
+	s.inString = false
+}
+
+// scan continues validating b starting at i. It returns the offset just past
+// the completed top-level value (scanDone), the offset at which to resume
+// once more data is available (scanNeedMore), or scanInvalid. When eof is
+// true the input is known to be complete, so a trailing number is accepted.
+func (s *valueScanner) scan(b []byte, i int, eof bool) (int, scanResult) {
+	state := s.state
+	if s.inString {
+		j, res := scanStringBody(b, i)
+		if res != scanDone {
+			if res == scanNeedMore && !eof {
+				return j, scanNeedMore
 			}
-			switch b[i] {
-			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+			return j, scanInvalid
+		}
+		s.inString = false
+		i = j
+		if s.afterStr == stColon {
+			state = stColon
+		} else {
+			if len(s.stack) == 0 {
+				return i, scanDone
+			}
+			state = stCommaOrClose
+		}
+	}
+	for {
+		for i < len(b) && charClass[b[i]]&ccSpace != 0 {
+			i++
+		}
+		if i >= len(b) {
+			s.state = state
+			if eof {
+				return i, scanInvalid
+			}
+			return i, scanNeedMore
+		}
+		c := b[i]
+		switch state {
+		case stColon:
+			if c != ':' {
+				return i, scanInvalid
+			}
+			i++
+			state = stValue
+			continue
+		case stCommaOrClose:
+			top := s.stack[len(s.stack)-1]
+			if c == ',' {
 				i++
-			case 'u':
-				if i+4 >= n {
-					return i, syntaxErr("bad unicode escape", i)
+				if top == '{' {
+					state = stKey
+				} else {
+					state = stValue
 				}
-				for k := 1; k <= 4; k++ {
-					x := b[i+k]
-					if !((x >= '0' && x <= '9') || (x >= 'a' && x <= 'f') || (x >= 'A' && x <= 'F')) {
-						return i, syntaxErr("bad unicode escape", i)
-					}
+				continue
+			}
+			if c == top+2 { // '[' + 2 == ']' and '{' + 2 == '}'
+				i++
+				s.stack = s.stack[:len(s.stack)-1]
+				if len(s.stack) == 0 {
+					return i, scanDone
 				}
-				i += 5
-			default:
-				return i, syntaxErr("bad escape", i)
+				continue
+			}
+			return i, scanInvalid
+		case stKeyOrClose:
+			if c == '}' {
+				i++
+				s.stack = s.stack[:len(s.stack)-1]
+				if len(s.stack) == 0 {
+					return i, scanDone
+				}
+				state = stCommaOrClose
+				continue
+			}
+			fallthrough
+		case stKey:
+			if c != '"' {
+				return i, scanInvalid
+			}
+			j, res := scanStringBody(b, i+1)
+			if res != scanDone {
+				if res == scanNeedMore && !eof {
+					s.inString, s.afterStr, s.state = true, stColon, state
+					return j, scanNeedMore
+				}
+				return j, scanInvalid
+			}
+			i = j
+			state = stColon
+			continue
+		case stValueOrClose:
+			if c == ']' {
+				i++
+				s.stack = s.stack[:len(s.stack)-1]
+				if len(s.stack) == 0 {
+					return i, scanDone
+				}
+				state = stCommaOrClose
+				continue
+			}
+		}
+		// stValue (or stValueOrClose with a value)
+		switch c {
+		case '{', '[':
+			if len(s.stack) >= maxNestingDepth {
+				return i, scanInvalid
+			}
+			s.stack = append(s.stack, c)
+			i++
+			if c == '{' {
+				state = stKeyOrClose
+			} else {
+				state = stValueOrClose
 			}
 			continue
+		case '"':
+			j, res := scanStringBody(b, i+1)
+			if res != scanDone {
+				if res == scanNeedMore && !eof {
+					s.inString, s.afterStr, s.state = true, stCommaOrClose, state
+					return j, scanNeedMore
+				}
+				return j, scanInvalid
+			}
+			i = j
+		case 't', 'f', 'n':
+			lit := "true"
+			if c == 'f' {
+				lit = "false"
+			} else if c == 'n' {
+				lit = "null"
+			}
+			for k := 1; k < len(lit); k++ {
+				if i+k >= len(b) {
+					s.state = state
+					if eof {
+						return i, scanInvalid
+					}
+					return i, scanNeedMore
+				}
+				if b[i+k] != lit[k] {
+					return i + k, scanInvalid
+				}
+			}
+			i += len(lit)
+		default:
+			j, res := scanNumber(b, i, eof)
+			if res != scanDone {
+				if res == scanNeedMore {
+					s.state = state
+				}
+				return j, res
+			}
+			i = j
 		}
-		i++
+		if len(s.stack) == 0 {
+			return i, scanDone
+		}
+		state = stCommaOrClose
 	}
-	return i, syntaxErr("unterminated string", i)
 }
 
-func Valid(b []byte) bool {
-	n, err := valueEnd(b, 0)
-	if err != nil {
-		return false
-	}
-	return skipWS(b, n) == len(b)
-}
-func bytesEqString(b []byte, s string) bool {
-	if len(b) != len(s) {
-		return false
-	}
-	for i := 0; i < len(b); i++ {
-		if b[i] != s[i] {
-			return false
-		}
-	}
-	return true
-}
-func parseIntBytes(b []byte) (int64, error) {
-	i := 0
-	neg := false
-	if len(b) > 0 && b[0] == '-' {
-		neg = true
-		i++
-	}
-	if i >= len(b) || b[i] < '0' || b[i] > '9' {
-		return 0, syntaxErr("bad number", i)
-	}
-	var n int64
-	overflow := int64(1<<63 - 1)
-	for i < len(b) && b[i] >= '0' && b[i] <= '9' {
-		d := int64(b[i] - '0')
-		if n > (overflow-d)/10 {
-			return 0, syntaxErr("number overflow", i)
-		}
-		n = n*10 + d
-		i++
-	}
-	if neg {
-		n = -n
-	}
-	return n, nil
-}
-func parseUintBytes(b []byte) (uint64, error) {
-	i := 0
-	if i >= len(b) || b[i] < '0' || b[i] > '9' {
-		return 0, syntaxErr("bad number", i)
-	}
-	var n uint64
-	overflow := ^uint64(0)
-	for i < len(b) && b[i] >= '0' && b[i] <= '9' {
-		d := uint64(b[i] - '0')
-		if n > (overflow-d)/10 {
-			return 0, syntaxErr("number overflow", i)
-		}
-		n = n*10 + d
-		i++
-	}
-	return n, nil
-}
-func unsafeString(b []byte) string {
-	if len(b) == 0 {
-		return ""
-	}
-	return unsafe.String(unsafe.SliceData(b), len(b))
-}
-
-// --- Lazy field extraction (Get family) ---
-
-// Get extracts the raw JSON value bytes for the named key from a JSON object.
-// It performs a single-pass scan and returns the value without any parsing or allocation.
-// Returns an error if the key is not found.
-func Get(src []byte, key string) ([]byte, error) {
-	i := skipWS(src, 0)
-	if i >= len(src) || src[i] != '{' {
-		return nil, syntaxErr("expected object", i)
-	}
-	i++
+// scanStringBody validates a string body starting just after the opening
+// quote and returns the offset past the closing quote. On scanNeedMore the
+// returned offset is a safe point to resume from (never inside an escape).
+func scanStringBody(b []byte, i int) (int, scanResult) {
 	for {
-		i = skipWS(src, i)
-		if i >= len(src) || src[i] == '}' {
-			return nil, fmt.Errorf("fastjson: key %q not found", key)
+		i = stringSpecial(b, i)
+		if i >= len(b) {
+			return i, scanNeedMore
 		}
-		if src[i] != '"' {
-			return nil, syntaxErr("expected object key", i)
+		switch c := b[i]; {
+		case c == '"':
+			return i + 1, scanDone
+		case c < 0x20:
+			return i, scanInvalid
 		}
-		ks := i + 1
-		j := ks
-		simple := true
-		for j < len(src) && src[j] != '"' {
-			if src[j] == '\\' || src[j] < 0x20 {
-				simple = false
-				break
+		// backslash escape
+		if i+1 >= len(b) {
+			return i, scanNeedMore
+		}
+		switch b[i+1] {
+		case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+			i += 2
+		case 'u':
+			for k := 2; k < 6; k++ {
+				if i+k >= len(b) {
+					return i, scanNeedMore
+				}
+				if charClass[b[i+k]]&ccHex == 0 {
+					return i + k, scanInvalid
+				}
 			}
-			j++
+			i += 6
+		default:
+			return i + 1, scanInvalid
 		}
-		var matched bool
-		if simple && j < len(src) {
-			matched = (j-ks) == len(key) && bytesEqString(src[ks:j], key)
-			i = j + 1
-		} else {
-			k, n, err := parseStringZC(src, i)
-			if err != nil {
-				return nil, err
-			}
-			matched = k == key
-			i = n
+	}
+}
+
+// scanNumber validates a number starting at b[i]. Without eof, a number that
+// runs to the end of b needs more data and is rescanned from i later.
+func scanNumber(b []byte, i int, eof bool) (int, scanResult) {
+	start := i
+	more := func() (int, scanResult) {
+		if eof {
+			return len(b), scanInvalid
 		}
-		i = skipWS(src, i)
-		if i >= len(src) || src[i] != ':' {
-			return nil, syntaxErr("expected colon", i)
+		return start, scanNeedMore
+	}
+	if b[i] == '-' {
+		i++
+		if i >= len(b) {
+			return more()
 		}
-		valStart := skipWS(src, i+1)
-		valEnd, err := valueEnd(src, valStart)
-		if err != nil {
-			return nil, err
-		}
-		if matched {
-			return src[valStart:valEnd], nil
-		}
-		i = skipWS(src, valEnd)
-		if i < len(src) && src[i] == ',' {
+	}
+	switch c := b[i]; {
+	case c == '0':
+		i++
+	case '1' <= c && c <= '9':
+		i++
+		for i < len(b) && charClass[b[i]]&ccDigit != 0 {
 			i++
-		} else if i < len(src) && src[i] == '}' {
-			return nil, fmt.Errorf("fastjson: key %q not found", key)
-		} else {
-			return nil, syntaxErr("expected comma or }", i)
+		}
+	default:
+		return i, scanInvalid
+	}
+	if i >= len(b) {
+		if eof {
+			return i, scanDone
+		}
+		return start, scanNeedMore
+	}
+	if b[i] == '.' {
+		i++
+		if i >= len(b) {
+			return more()
+		}
+		if charClass[b[i]]&ccDigit == 0 {
+			return i, scanInvalid
+		}
+		for i < len(b) && charClass[b[i]]&ccDigit != 0 {
+			i++
+		}
+		if i >= len(b) {
+			if eof {
+				return i, scanDone
+			}
+			return start, scanNeedMore
 		}
 	}
+	if b[i] == 'e' || b[i] == 'E' {
+		i++
+		if i >= len(b) {
+			return more()
+		}
+		if b[i] == '+' || b[i] == '-' {
+			i++
+			if i >= len(b) {
+				return more()
+			}
+		}
+		if charClass[b[i]]&ccDigit == 0 {
+			return i, scanInvalid
+		}
+		for i < len(b) && charClass[b[i]]&ccDigit != 0 {
+			i++
+		}
+		if i >= len(b) && !eof {
+			return start, scanNeedMore
+		}
+	}
+	return i, scanDone
 }
 
-// GetString extracts the value for key as a string.
-func GetString(src []byte, key string) (string, error) {
-	raw, err := Get(src, key)
-	if err != nil {
-		return "", err
-	}
-	if len(raw) == 0 || raw[0] != '"' {
-		return "", syntaxErr("expected string", 0)
-	}
-	s, _, err := parseStringZC(raw, 0)
-	return s, err
+var valueScannerPool = sync.Pool{New: func() any { return new(valueScanner) }}
+
+func getValueScanner() *valueScanner {
+	s := valueScannerPool.Get().(*valueScanner)
+	s.reset()
+	return s
 }
 
-// GetInt extracts the value for key as an int64.
-func GetInt(src []byte, key string) (int64, error) {
-	raw, err := Get(src, key)
-	if err != nil {
-		return 0, err
+func putValueScanner(s *valueScanner) {
+	if cap(s.stack) > 1024 {
+		s.stack = nil
 	}
-	return parseIntBytes(raw)
+	valueScannerPool.Put(s)
 }
 
-// GetFloat64 extracts the value for key as a float64.
-func GetFloat64(src []byte, key string) (float64, error) {
-	raw, err := Get(src, key)
-	if err != nil {
-		return 0, err
-	}
-	return strconv.ParseFloat(unsafeString(raw), 64)
+// valid reports whether data is exactly one JSON value surrounded by
+// optional whitespace.
+func valid(data []byte) bool {
+	s := getValueScanner()
+	n, res := s.scan(data, 0, true)
+	putValueScanner(s)
+	return res == scanDone && skipSpace(data, n) == len(data)
 }
 
-// GetBool extracts the value for key as a bool.
-func GetBool(src []byte, key string) (bool, error) {
-	raw, err := Get(src, key)
-	if err != nil {
-		return false, err
+// checkValid validates data and returns the exact encoding/json syntax error
+// when it is invalid.
+func checkValid(data []byte) error {
+	if valid(data) {
+		return nil
 	}
-	if len(raw) == 4 && raw[0] == 't' && raw[1] == 'r' && raw[2] == 'u' && raw[3] == 'e' {
-		return true, nil
-	}
-	if len(raw) == 5 && raw[0] == 'f' && raw[1] == 'a' && raw[2] == 'l' && raw[3] == 's' && raw[4] == 'e' {
-		return false, nil
-	}
-	return false, syntaxErr("expected bool", 0)
+	return stdSyntaxError(data, 0, true)
 }
