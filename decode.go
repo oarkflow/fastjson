@@ -24,6 +24,13 @@ func Unmarshal(data []byte, v any) error {
 	return unmarshalValid(data, v, false, false)
 }
 
+// UnmarshalValid decodes data directly into v without running an upfront
+// validation pass. The caller must guarantee that data is valid JSON
+// (e.g., received from a trusted store or upstream service).
+func UnmarshalValid(data []byte, v any) error {
+	return unmarshalValid(data, v, false, false)
+}
+
 // unmarshalValid decodes data, which must already be known to be valid JSON.
 func unmarshalValid(data []byte, v any, useNumber, disallowUnknown bool) error {
 	rt := reflect.TypeOf(v)
@@ -114,8 +121,12 @@ func (d *decodeState) addErrorContext(err error) error {
 }
 
 func (d *decodeState) skipWS() {
-	for d.off < len(d.data) && charClass[d.data[d.off]]&ccSpace != 0 {
-		d.off++
+	for d.off < len(d.data) {
+		if c := d.data[d.off]; c <= ' ' && (spaceMask&(1<<c)) != 0 {
+			d.off++
+			continue
+		}
+		break
 	}
 }
 
@@ -1132,9 +1143,10 @@ func (sd *structDecoder) decode(d *decodeState, p unsafe.Pointer) error {
 			key = d.scratch
 		}
 		fi := -1
-		if next < len(sd.fields) && string(key) == sd.fields[next].name {
+		skey := unsafeString(key)
+		if next < len(sd.fields) && skey == sd.fields[next].name {
 			fi = next
-		} else if i, ok := sd.exact[string(key)]; ok {
+		} else if i, ok := sd.exact[skey]; ok {
 			fi = i
 		} else if i, ok := sd.folded[string(foldName(key))]; ok {
 			fi = i

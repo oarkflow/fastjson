@@ -7,7 +7,12 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	jsoniter "github.com/json-iterator/go"
 )
+
+var jsoniterAPI = jsoniter.ConfigCompatibleWithStandardLibrary
+
 
 type BenchAddress struct {
 	City    string `json:"city"`
@@ -42,6 +47,16 @@ func BenchmarkFastjsonMarshalStruct(b *testing.B) {
 		sinkBytes = out
 	}
 }
+func BenchmarkJsoniterMarshalStruct(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		out, err := jsoniterAPI.Marshal(benchUser)
+		if err != nil {
+			b.Fatal(err)
+		}
+		sinkBytes = out
+	}
+}
 func BenchmarkStdlibMarshalStruct(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
@@ -57,6 +72,26 @@ func BenchmarkFastjsonUnmarshalStruct(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var u BenchUser
 		if err := Unmarshal(benchJSON, &u); err != nil {
+			b.Fatal(err)
+		}
+		sinkUser = u
+	}
+}
+func BenchmarkFastjsonUnmarshalValidStruct(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var u BenchUser
+		if err := UnmarshalValid(benchJSON, &u); err != nil {
+			b.Fatal(err)
+		}
+		sinkUser = u
+	}
+}
+func BenchmarkJsoniterUnmarshalStruct(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var u BenchUser
+		if err := jsoniterAPI.Unmarshal(benchJSON, &u); err != nil {
 			b.Fatal(err)
 		}
 		sinkUser = u

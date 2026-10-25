@@ -39,11 +39,19 @@ var charClass = func() (t [256]uint8) {
 	return t
 }()
 
-func isSpace(c byte) bool { return charClass[c]&ccSpace != 0 }
+const spaceMask uint64 = (1 << ' ') | (1 << '\t') | (1 << '\n') | (1 << '\r')
+
+func isSpace(c byte) bool {
+	return c <= ' ' && (spaceMask&(1<<c)) != 0
+}
 
 func skipSpace(b []byte, i int) int {
-	for i < len(b) && charClass[b[i]]&ccSpace != 0 {
-		i++
+	for i < len(b) {
+		if c := b[i]; c <= ' ' && (spaceMask&(1<<c)) != 0 {
+			i++
+			continue
+		}
+		break
 	}
 	return i
 }
@@ -68,13 +76,16 @@ func hasLess(x uint64, n byte) uint64 { return (x - lsb*uint64(n)) & ^x & msb }
 func stringSpecial(b []byte, i int) int {
 	for i+8 <= len(b) {
 		w := binary.LittleEndian.Uint64(b[i:])
-		if m := hasByte(w, '"') | hasByte(w, '\\') | hasLess(w, 0x20); m != 0 {
+		x1 := w ^ (lsb * '"')
+		x2 := w ^ (lsb * '\\')
+		m := (((x1 - lsb) & ^x1) | ((x2 - lsb) & ^x2) | ((w - lsb*0x20) & ^w)) & msb
+		if m != 0 {
 			return i + bits.TrailingZeros64(m)/8
 		}
 		i += 8
 	}
 	for i < len(b) {
-		if charClass[b[i]]&ccStrSpecial != 0 {
+		if c := b[i]; c == '"' || c == '\\' || c < 0x20 {
 			return i
 		}
 		i++
@@ -142,9 +153,7 @@ func (s *valueScanner) scan(b []byte, i int, eof bool) (int, scanResult) {
 		}
 	}
 	for {
-		for i < len(b) && charClass[b[i]]&ccSpace != 0 {
-			i++
-		}
+		i = skipSpace(b, i)
 		if i >= len(b) {
 			s.state = state
 			if eof {
@@ -166,10 +175,29 @@ func (s *valueScanner) scan(b []byte, i int, eof bool) (int, scanResult) {
 			if c == ',' {
 				i++
 				if top == '{' {
+					i = skipSpace(b, i)
+					if i < len(b) && b[i] == '"' {
+						j, res := scanStringBody(b, i+1)
+						if res == scanDone {
+							i = skipSpace(b, j)
+							if i < len(b) && b[i] == ':' {
+								i++
+								state = stValue
+								continue
+							}
+							state = stColon
+							continue
+						}
+						if res == scanNeedMore && !eof {
+							s.inString, s.afterStr, s.state = true, stColon, stKey
+							return j, scanNeedMore
+						}
+						return j, scanInvalid
+					}
 					state = stKey
-				} else {
-					state = stValue
+					continue
 				}
+				state = stValue
 				continue
 			}
 			if c == top+2 { // '[' + 2 == ']' and '{' + 2 == '}'
@@ -204,7 +232,12 @@ func (s *valueScanner) scan(b []byte, i int, eof bool) (int, scanResult) {
 				}
 				return j, scanInvalid
 			}
-			i = j
+			i = skipSpace(b, j)
+			if i < len(b) && b[i] == ':' {
+				i++
+				state = stValue
+				continue
+			}
 			state = stColon
 			continue
 		case stValueOrClose:
@@ -338,7 +371,7 @@ func scanNumber(b []byte, i int, eof bool) (int, scanResult) {
 		i++
 	case '1' <= c && c <= '9':
 		i++
-		for i < len(b) && charClass[b[i]]&ccDigit != 0 {
+		for i < len(b) && b[i]-'0' <= 9 {
 			i++
 		}
 	default:
@@ -355,10 +388,10 @@ func scanNumber(b []byte, i int, eof bool) (int, scanResult) {
 		if i >= len(b) {
 			return more()
 		}
-		if charClass[b[i]]&ccDigit == 0 {
+		if b[i]-'0' > 9 {
 			return i, scanInvalid
 		}
-		for i < len(b) && charClass[b[i]]&ccDigit != 0 {
+		for i < len(b) && b[i]-'0' <= 9 {
 			i++
 		}
 		if i >= len(b) {
@@ -379,10 +412,10 @@ func scanNumber(b []byte, i int, eof bool) (int, scanResult) {
 				return more()
 			}
 		}
-		if charClass[b[i]]&ccDigit == 0 {
+		if b[i]-'0' > 9 {
 			return i, scanInvalid
 		}
-		for i < len(b) && charClass[b[i]]&ccDigit != 0 {
+		for i < len(b) && b[i]-'0' <= 9 {
 			i++
 		}
 		if i >= len(b) && !eof {
